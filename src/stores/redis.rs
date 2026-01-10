@@ -161,7 +161,7 @@ where
             .collect();
 
         let _: () = conn.del(&cache_keys).await.map_err(|e| {
-            CacheError::operation("redis", &cache_keys.join(","), format!("DEL failed: {}", e))
+            CacheError::operation("redis", cache_keys.join(","), format!("DEL failed: {}", e))
         })?;
 
         Ok(())

@@ -55,7 +55,7 @@ mod tests {
     fn test_rand_simple_in_range() {
         for _ in 0..100 {
             let r = rand_simple();
-            assert!(r >= 0.0 && r <= 1.0);
+            assert!((0.0..=1.0).contains(&r));
         }
     }
 }

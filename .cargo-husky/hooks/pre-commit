@@ -1,0 +1,20 @@
+#!/bin/sh
+# cargo-husky pre-commit hook
+# Runs cargo fmt and cargo clippy before each commit
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Run cargo fmt to auto-format code
+echo "→ Running cargo fmt..."
+cargo fmt --all
+
+# Stage any formatting changes
+git diff --name-only --cached | grep -E '\.rs$' | xargs -r git add 2>/dev/null || true
+
+# Run clippy with warnings as errors
+echo "→ Running cargo clippy..."
+cargo clippy --all-targets --all-features -- -D warnings
+
+echo "✓ Pre-commit checks passed!"

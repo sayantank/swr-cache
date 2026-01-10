@@ -25,16 +25,10 @@ pub struct EvictOnSetConfig {
 }
 
 /// Configuration for HashMapStore.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HashMapStoreConfig {
     /// Remove expired entries on every `set` operation.
     pub evict_on_set: Option<EvictOnSetConfig>,
-}
-
-impl Default for HashMapStoreConfig {
-    fn default() -> Self {
-        HashMapStoreConfig { evict_on_set: None }
-    }
 }
 
 /// Internal stored entry with expiration time.

@@ -71,7 +71,7 @@ where
             if let Some(ref entry) = res {
                 // Fill all lower (earlier) tiers with this value in the background
                 if i > 0 {
-                    let lower_tiers: Vec<_> = self.tiers[..i].iter().cloned().collect();
+                    let lower_tiers: Vec<_> = self.tiers[..i].to_vec();
                     let entry_clone = entry.clone();
                     let namespace_clone = namespace.clone();
                     let key_clone = key.to_string();
@@ -110,9 +110,7 @@ where
 
         // Return first error if any
         for result in results {
-            if let Err(e) = result {
-                return Err(e);
-            }
+            result?;
         }
 
         Ok(())
@@ -140,9 +138,7 @@ where
 
         // Return first error if any
         for result in results {
-            if let Err(e) = result {
-                return Err(e);
-            }
+            result?;
         }
 
         Ok(())

@@ -10,6 +10,10 @@ use crate::error::CacheError;
 use crate::store::Store;
 use crate::utils::{build_cache_key, now_ms};
 
+/// Type alias for the complex revalidation state type.
+type RevalidationState<V> =
+    Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<Option<oneshot::Receiver<Option<V>>>>>>>>;
+
 /// Result of an internal get operation.
 struct GetResult<V> {
     value: Option<V>,
@@ -34,8 +38,7 @@ where
     fresh_ms: i64,
     stale_ms: i64,
     /// To prevent concurrent revalidation of the same data, all revalidations are deduplicated.
-    revalidating:
-        Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<Option<oneshot::Receiver<Option<V>>>>>>>>,
+    revalidating: RevalidationState<V>,
 }
 
 impl<N, V> Clone for SwrCache<N, V>

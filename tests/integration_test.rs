@@ -17,6 +17,7 @@ use swr_cache::{
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 enum TestNamespace {
     Users,
+    #[allow(dead_code)]
     Products,
 }
 
