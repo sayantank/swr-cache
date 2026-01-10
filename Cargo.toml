@@ -1,0 +1,22 @@
+[package]
+name = "swr-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "rt-multi-thread"] }
+async-trait = "0.1"
+thiserror = "2"
+futures = "0.3.31"
+redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+moka = { version = "0.12", features = ["future"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "cache_benchmark"
+harness = false
