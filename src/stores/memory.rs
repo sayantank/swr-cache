@@ -1,7 +1,5 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::fmt::Display;
-use std::hash::Hash;
 use tokio::sync::RwLock;
 
 use crate::entry::Entry;
@@ -46,19 +44,16 @@ struct StoredEntry<V> {
 /// - Applications prioritizing simplicity over performance
 ///
 /// For high-concurrency scenarios, consider using `MokaStore` instead.
-pub struct HashMapStore<N, V>
+pub struct HashMapStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Send + Sync,
 {
     state: RwLock<HashMap<String, StoredEntry<V>>>,
     evict_on_set: Option<EvictOnSetConfig>,
-    _marker: std::marker::PhantomData<N>,
 }
 
-impl<N, V> HashMapStore<N, V>
+impl<V> HashMapStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Send + Sync,
 {
     /// Create a new HashMapStore with the given configuration.
@@ -66,7 +61,6 @@ where
         HashMapStore {
             state: RwLock::new(HashMap::new()),
             evict_on_set: config.evict_on_set,
-            _marker: std::marker::PhantomData,
         }
     }
 
@@ -112,17 +106,16 @@ where
 }
 
 #[async_trait]
-impl<N, V> Store<N, V> for HashMapStore<N, V>
+impl<V> Store<V> for HashMapStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Send + Sync,
 {
     fn name(&self) -> &'static str {
         "hashmap"
     }
 
-    async fn get(&self, namespace: N, key: &str) -> Result<Option<Entry<V>>, CacheError> {
-        let cache_key = build_cache_key(&namespace, key);
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Entry<V>>, CacheError> {
+        let cache_key = build_cache_key(namespace, key);
         let state = self.state.read().await;
 
         let Some(stored) = state.get(&cache_key) else {
@@ -141,8 +134,8 @@ where
         Ok(Some(stored.entry.clone()))
     }
 
-    async fn set(&self, namespace: N, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
-        let cache_key = build_cache_key(&namespace, key);
+    async fn set(&self, namespace: &str, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
+        let cache_key = build_cache_key(namespace, key);
 
         {
             let mut state = self.state.write().await;
@@ -159,11 +152,11 @@ where
         Ok(())
     }
 
-    async fn remove(&self, namespace: N, keys: &[&str]) -> Result<(), CacheError> {
+    async fn remove(&self, namespace: &str, keys: &[&str]) -> Result<(), CacheError> {
         let mut state = self.state.write().await;
 
         for key in keys {
-            let cache_key = build_cache_key(&namespace, key);
+            let cache_key = build_cache_key(namespace, key);
             state.remove(&cache_key);
         }
 
@@ -175,46 +168,29 @@ where
 mod tests {
     use super::*;
 
-    #[derive(Clone, Eq, PartialEq, Hash)]
-    enum TestNamespace {
-        Users,
-    }
-
-    impl Display for TestNamespace {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                TestNamespace::Users => write!(f, "users"),
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_get_set_remove() {
-        let store: HashMapStore<TestNamespace, String> =
-            HashMapStore::new(HashMapStoreConfig::default());
+        let store: HashMapStore<String> = HashMapStore::new(HashMapStoreConfig::default());
 
         // Initially empty
-        let result = store.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_none());
 
         // Set a value
         let now = now_ms();
         let entry = Entry::new("value1".to_string(), now + 60_000, now + 300_000);
-        store
-            .set(TestNamespace::Users, "key1", entry)
-            .await
-            .unwrap();
+        store.set("users", "key1", entry).await.unwrap();
 
         // Get the value
-        let result = store.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().value, "value1");
 
         // Remove the value
-        store.remove(TestNamespace::Users, &["key1"]).await.unwrap();
+        store.remove("users", &["key1"]).await.unwrap();
 
         // Should be gone
-        let result = store.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_none());
     }
 }

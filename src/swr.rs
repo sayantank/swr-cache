@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::future::Future;
-use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::{RwLock, oneshot};
 
@@ -30,21 +28,19 @@ pub struct SetOptions {
 }
 
 /// Internal cache implementation with stale-while-revalidate support.
-pub struct SwrCache<N, V>
+pub struct SwrCache<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Send + Sync,
 {
-    store: Arc<dyn Store<N, V>>,
+    store: Arc<dyn Store<V>>,
     fresh_ms: i64,
     stale_ms: i64,
     /// To prevent concurrent revalidation of the same data, all revalidations are deduplicated.
     revalidating: RevalidationState<V>,
 }
 
-impl<N, V> Clone for SwrCache<N, V>
+impl<V> Clone for SwrCache<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Send + Sync,
 {
     fn clone(&self) -> Self {
@@ -57,9 +53,8 @@ where
     }
 }
 
-impl<N, V> SwrCache<N, V>
+impl<V> SwrCache<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
     /// Create a new SWR cache.
@@ -68,7 +63,7 @@ where
     /// * `store` - The underlying store implementation
     /// * `fresh_ms` - Default time in milliseconds before an entry becomes stale
     /// * `stale_ms` - Default time in milliseconds before an entry expires completely
-    pub fn new(store: Arc<dyn Store<N, V>>, fresh_ms: i64, stale_ms: i64) -> Self {
+    pub fn new(store: Arc<dyn Store<V>>, fresh_ms: i64, stale_ms: i64) -> Self {
         SwrCache {
             store,
             fresh_ms,
@@ -80,14 +75,14 @@ where
     /// Return the cached value.
     ///
     /// The response will be `None` for cache misses.
-    pub async fn get(&self, namespace: N, key: &str) -> Result<Option<V>, CacheError> {
+    pub async fn get(&self, namespace: &str, key: &str) -> Result<Option<V>, CacheError> {
         let result = self.get_internal(namespace, key).await?;
         Ok(result.value)
     }
 
     /// Internal get that also indicates if revalidation is needed.
-    async fn get_internal(&self, namespace: N, key: &str) -> Result<GetResult<V>, CacheError> {
-        let res = self.store.get(namespace.clone(), key).await?;
+    async fn get_internal(&self, namespace: &str, key: &str) -> Result<GetResult<V>, CacheError> {
+        let res = self.store.get(namespace, key).await?;
 
         let Some(entry) = res else {
             return Ok(GetResult {
@@ -130,7 +125,7 @@ where
     /// Set the value in the cache.
     pub async fn set(
         &self,
-        namespace: N,
+        namespace: &str,
         key: &str,
         value: V,
         opts: Option<SetOptions>,
@@ -144,19 +139,20 @@ where
     }
 
     /// Removes the key from the cache.
-    pub async fn remove(&self, namespace: N, key: &str) -> Result<(), CacheError> {
+    pub async fn remove(&self, namespace: &str, key: &str) -> Result<(), CacheError> {
         self.store.remove(namespace, &[key]).await
     }
 
     /// Cache a value in the background.
-    fn cache_value(&self, namespace: N, key: &str, value: V) {
+    fn cache_value(&self, namespace: &str, key: &str, value: V) {
         let store = self.store.clone();
+        let namespace = namespace.to_string();
         let key = key.to_string();
         let now = now_ms();
         let entry = Entry::new(value, now + self.fresh_ms, now + self.stale_ms);
 
         tokio::spawn(async move {
-            let _ = store.set(namespace, &key, entry).await;
+            let _ = store.set(&namespace, &key, entry).await;
         });
     }
 
@@ -170,10 +166,10 @@ where
     /// # Arguments
     /// * `namespace` - The cache namespace
     /// * `key` - The cache key
-    /// * `load_from_origin` - Function to load the value if not cached
+    /// * `load_from_origin` - Function to load the value if not cached (receives the key)
     pub async fn swr<F, Fut>(
         &self,
-        namespace: N,
+        namespace: &str,
         key: &str,
         load_from_origin: F,
     ) -> Result<Option<V>, CacheError>
@@ -181,7 +177,7 @@ where
         F: FnOnce(String) -> Fut + Send + 'static,
         Fut: Future<Output = Option<V>> + Send,
     {
-        let res = self.get_internal(namespace.clone(), key).await;
+        let res = self.get_internal(namespace, key).await;
 
         match res {
             Ok(GetResult {
@@ -190,7 +186,7 @@ where
                 is_expired: false,
             }) => {
                 // Return stale value, revalidate in background
-                self.spawn_revalidation(namespace.clone(), key, load_from_origin);
+                self.spawn_revalidation(namespace, key, load_from_origin);
                 Ok(Some(value))
             }
             Ok(GetResult {
@@ -200,7 +196,7 @@ where
             }) => {
                 // Expired data - try origin synchronously, fallback to expired
                 match self
-                    .deduplicated_load_from_origin(namespace.clone(), key, load_from_origin)
+                    .deduplicated_load_from_origin(namespace, key, load_from_origin)
                     .await
                 {
                     Ok(Some(fresh_value)) => {
@@ -230,12 +226,12 @@ where
                 // This shouldn't happen (expired should always trigger revalidation)
                 // but handle it defensively by treating as cache miss
                 match self
-                    .deduplicated_load_from_origin(namespace.clone(), key, load_from_origin)
+                    .deduplicated_load_from_origin(namespace, key, load_from_origin)
                     .await
                 {
                     Ok(value) => {
                         if let Some(ref v) = value {
-                            self.cache_value(namespace.clone(), key, v.clone());
+                            self.cache_value(namespace, key, v.clone());
                         }
                         Ok(value)
                     }
@@ -245,13 +241,13 @@ where
             Ok(GetResult { value: None, .. }) | Err(_) => {
                 // Cache miss or error - load from origin
                 match self
-                    .deduplicated_load_from_origin(namespace.clone(), key, load_from_origin)
+                    .deduplicated_load_from_origin(namespace, key, load_from_origin)
                     .await
                 {
                     Ok(value) => {
                         // Cache in background
                         if let Some(ref v) = value {
-                            self.cache_value(namespace.clone(), key, v.clone());
+                            self.cache_value(namespace, key, v.clone());
                         }
                         Ok(value)
                     }
@@ -262,13 +258,14 @@ where
     }
 
     /// Spawn a background revalidation task.
-    fn spawn_revalidation<F, Fut>(&self, namespace: N, key: &str, load_from_origin: F)
+    fn spawn_revalidation<F, Fut>(&self, namespace: &str, key: &str, load_from_origin: F)
     where
         F: FnOnce(String) -> Fut + Send + 'static,
         Fut: Future<Output = Option<V>> + Send,
     {
         let store = self.store.clone();
         let revalidating = self.revalidating.clone();
+        let namespace = namespace.to_string();
         let key = key.to_string();
         let revalidate_key = build_cache_key(&namespace, &key);
         let fresh_ms = self.fresh_ms;
@@ -292,14 +289,14 @@ where
                 );
             }
 
-            // Load from origin
+            // Load from origin - pass the actual key, not the composite cache key
             let value = load_from_origin(key.clone()).await;
 
             // Update cache
             if let Some(ref v) = value {
                 let now = crate::utils::now_ms();
                 let entry = Entry::new(v.clone(), now + fresh_ms, now + stale_ms);
-                let _ = store.set(namespace, &key, entry).await;
+                let _ = store.set(&namespace, &key, entry).await;
             }
 
             // Remove from revalidating
@@ -313,7 +310,7 @@ where
     /// Deduplicate concurrent loads from origin.
     async fn deduplicated_load_from_origin<F, Fut>(
         &self,
-        namespace: N,
+        namespace: &str,
         key: &str,
         load_from_origin: F,
     ) -> Result<Option<V>, Box<dyn std::error::Error + Send + Sync>>
@@ -348,7 +345,7 @@ where
             );
         }
 
-        // Load from origin
+        // Load from origin - pass the actual key, not the composite cache key
         let result = load_from_origin(key.to_string()).await;
 
         // Remove from revalidating
@@ -367,22 +364,9 @@ mod tests {
     use crate::stores::memory::{HashMapStore, HashMapStoreConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Clone, Eq, PartialEq, Hash)]
-    enum TestNamespace {
-        Users,
-    }
-
-    impl Display for TestNamespace {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                TestNamespace::Users => write!(f, "users"),
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_swr_cache_miss_loads_from_origin() {
-        let store: Arc<dyn Store<TestNamespace, String>> =
+        let store: Arc<dyn Store<String>> =
             Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
         let cache = SwrCache::new(store, 60_000, 300_000);
 
@@ -390,9 +374,11 @@ mod tests {
         let call_count_clone = call_count.clone();
 
         let result = cache
-            .swr(TestNamespace::Users, "key1", move |_key| {
+            .swr("users", "key1", move |key| {
                 let count = call_count_clone.clone();
                 async move {
+                    // Verify we receive the actual key, not composite
+                    assert_eq!(key, "key1");
                     count.fetch_add(1, Ordering::SeqCst);
                     Some("loaded_value".to_string())
                 }
@@ -409,7 +395,7 @@ mod tests {
         // Second call should hit cache
         let call_count_clone = call_count.clone();
         let result = cache
-            .swr(TestNamespace::Users, "key1", move |_key| {
+            .swr("users", "key1", move |_key| {
                 let count = call_count_clone.clone();
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -426,29 +412,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_and_set() {
-        let store: Arc<dyn Store<TestNamespace, String>> =
+        let store: Arc<dyn Store<String>> =
             Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
         let cache = SwrCache::new(store, 60_000, 300_000);
 
         // Initially empty
-        let result = cache.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = cache.get("users", "key1").await.unwrap();
         assert!(result.is_none());
 
         // Set a value
         cache
-            .set(TestNamespace::Users, "key1", "value1".to_string(), None)
+            .set("users", "key1", "value1".to_string(), None)
             .await
             .unwrap();
 
         // Get the value
-        let result = cache.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = cache.get("users", "key1").await.unwrap();
         assert_eq!(result, Some("value1".to_string()));
 
         // Remove the value
-        cache.remove(TestNamespace::Users, "key1").await.unwrap();
+        cache.remove("users", "key1").await.unwrap();
 
         // Should be gone
-        let result = cache.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = cache.get("users", "key1").await.unwrap();
         assert!(result.is_none());
     }
 }

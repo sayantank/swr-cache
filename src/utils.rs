@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Build a composite cache key from namespace and key.
 ///
 /// Format: `{namespace}::{key}`
-pub fn build_cache_key<N: Display>(namespace: &N, key: &str) -> String {
+pub fn build_cache_key<N: Display + ?Sized>(namespace: &N, key: &str) -> String {
     format!("{}::{}", namespace, key)
 }
 

@@ -2,8 +2,6 @@ use async_trait::async_trait;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
 use serde::{Serialize, de::DeserializeOwned};
-use std::fmt::Display;
-use std::hash::Hash;
 use std::marker::PhantomData;
 
 use crate::entry::Entry;
@@ -45,19 +43,17 @@ pub struct RedisStoreConfig {
 /// useful for keeping stale data available during origin outages.
 ///
 /// Requires `V` to implement `Serialize` and `DeserializeOwned`.
-pub struct RedisStore<N, V>
+pub struct RedisStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Serialize + DeserializeOwned + Send + Sync,
 {
     connection: MultiplexedConnection,
     disable_expiration: bool,
-    _marker: PhantomData<(N, V)>,
+    _marker: PhantomData<V>,
 }
 
-impl<N, V> RedisStore<N, V>
+impl<V> RedisStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Serialize + DeserializeOwned + Send + Sync,
 {
     /// Create a new RedisStore with the given configuration.
@@ -107,17 +103,16 @@ where
 }
 
 #[async_trait]
-impl<N, V> Store<N, V> for RedisStore<N, V>
+impl<V> Store<V> for RedisStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Serialize + DeserializeOwned + Send + Sync,
 {
     fn name(&self) -> &'static str {
         "redis"
     }
 
-    async fn get(&self, namespace: N, key: &str) -> Result<Option<Entry<V>>, CacheError> {
-        let cache_key = build_cache_key(&namespace, key);
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Entry<V>>, CacheError> {
+        let cache_key = build_cache_key(namespace, key);
         let mut conn = self.connection.clone();
 
         let result: Option<String> = conn
@@ -154,8 +149,8 @@ where
         }
     }
 
-    async fn set(&self, namespace: N, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
-        let cache_key = build_cache_key(&namespace, key);
+    async fn set(&self, namespace: &str, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
+        let cache_key = build_cache_key(namespace, key);
         let mut conn = self.connection.clone();
 
         let json_str = serde_json::to_string(&entry).map_err(|e| {
@@ -180,16 +175,13 @@ where
         Ok(())
     }
 
-    async fn remove(&self, namespace: N, keys: &[&str]) -> Result<(), CacheError> {
+    async fn remove(&self, namespace: &str, keys: &[&str]) -> Result<(), CacheError> {
         if keys.is_empty() {
             return Ok(());
         }
 
         let mut conn = self.connection.clone();
-        let cache_keys: Vec<String> = keys
-            .iter()
-            .map(|k| build_cache_key(&namespace, k))
-            .collect();
+        let cache_keys: Vec<String> = keys.iter().map(|k| build_cache_key(namespace, k)).collect();
 
         let _: () = conn.del(&cache_keys).await.map_err(|e| {
             CacheError::operation("redis", cache_keys.join(","), format!("DEL failed: {}", e))
@@ -206,19 +198,6 @@ mod tests {
     // Note: These tests require a running Redis instance.
     // Run with: cargo test --features redis-tests -- --ignored
 
-    #[derive(Clone, Eq, PartialEq, Hash)]
-    enum TestNamespace {
-        Users,
-    }
-
-    impl Display for TestNamespace {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                TestNamespace::Users => write!(f, "users"),
-            }
-        }
-    }
-
     #[tokio::test]
     #[ignore = "requires running Redis instance"]
     async fn test_redis_get_set_remove() {
@@ -227,33 +206,27 @@ mod tests {
             disable_expiration: false,
         };
 
-        let store: RedisStore<TestNamespace, String> = RedisStore::new(config).await.unwrap();
+        let store: RedisStore<String> = RedisStore::new(config).await.unwrap();
 
         // Initially empty
-        let result = store.get(TestNamespace::Users, "test_key").await.unwrap();
+        let result = store.get("users", "test_key").await.unwrap();
         assert!(result.is_none());
 
         // Set a value
         let now = now_ms();
         let entry = Entry::new("test_value".to_string(), now + 60_000, now + 300_000);
-        store
-            .set(TestNamespace::Users, "test_key", entry)
-            .await
-            .unwrap();
+        store.set("users", "test_key", entry).await.unwrap();
 
         // Get the value
-        let result = store.get(TestNamespace::Users, "test_key").await.unwrap();
+        let result = store.get("users", "test_key").await.unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().value, "test_value");
 
         // Remove the value
-        store
-            .remove(TestNamespace::Users, &["test_key"])
-            .await
-            .unwrap();
+        store.remove("users", &["test_key"]).await.unwrap();
 
         // Should be gone
-        let result = store.get(TestNamespace::Users, "test_key").await.unwrap();
+        let result = store.get("users", "test_key").await.unwrap();
         assert!(result.is_none());
     }
 }

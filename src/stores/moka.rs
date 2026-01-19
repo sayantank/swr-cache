@@ -1,8 +1,5 @@
 use async_trait::async_trait;
 use moka::future::Cache;
-use std::fmt::Display;
-use std::hash::Hash;
-use std::marker::PhantomData;
 use std::time::Duration;
 
 use crate::entry::Entry;
@@ -47,18 +44,15 @@ impl Default for MokaStoreConfig {
 /// - High throughput
 /// - Low P99 latency
 /// - Predictable performance under load
-pub struct MokaStore<N, V>
+pub struct MokaStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync,
     V: Clone + Send + Sync,
 {
     cache: Cache<String, Entry<V>>,
-    _marker: PhantomData<N>,
 }
 
-impl<N, V> MokaStore<N, V>
+impl<V> MokaStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
     /// Create a new MokaStore with the given configuration.
@@ -85,7 +79,6 @@ where
 
         MokaStore {
             cache: builder.build(),
-            _marker: PhantomData,
         }
     }
 
@@ -98,17 +91,16 @@ where
 }
 
 #[async_trait]
-impl<N, V> Store<N, V> for MokaStore<N, V>
+impl<V> Store<V> for MokaStore<V>
 where
-    N: Clone + Eq + Hash + Display + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
     fn name(&self) -> &'static str {
         "moka"
     }
 
-    async fn get(&self, namespace: N, key: &str) -> Result<Option<Entry<V>>, CacheError> {
-        let cache_key = build_cache_key(&namespace, key);
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Entry<V>>, CacheError> {
+        let cache_key = build_cache_key(namespace, key);
 
         match self.cache.get(&cache_key).await {
             Some(entry) => {
@@ -127,8 +119,8 @@ where
         }
     }
 
-    async fn set(&self, namespace: N, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
-        let cache_key = build_cache_key(&namespace, key);
+    async fn set(&self, namespace: &str, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
+        let cache_key = build_cache_key(namespace, key);
 
         // Insert into Moka cache
         // Moka handles eviction automatically based on capacity
@@ -137,9 +129,9 @@ where
         Ok(())
     }
 
-    async fn remove(&self, namespace: N, keys: &[&str]) -> Result<(), CacheError> {
+    async fn remove(&self, namespace: &str, keys: &[&str]) -> Result<(), CacheError> {
         for key in keys {
-            let cache_key = build_cache_key(&namespace, key);
+            let cache_key = build_cache_key(namespace, key);
             self.cache.invalidate(&cache_key).await;
         }
 
@@ -151,72 +143,47 @@ where
 mod tests {
     use super::*;
 
-    #[derive(Clone, Eq, PartialEq, Hash)]
-    enum TestNamespace {
-        Users,
-    }
-
-    impl Display for TestNamespace {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                TestNamespace::Users => write!(f, "users"),
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_get_set_remove() {
-        let store: MokaStore<TestNamespace, String> = MokaStore::new(MokaStoreConfig::default());
+        let store: MokaStore<String> = MokaStore::new(MokaStoreConfig::default());
 
         // Initially empty
-        let result = store.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_none());
 
         // Set a value
         let now = now_ms();
         let entry = Entry::new("value1".to_string(), now + 60_000, now + 300_000);
-        store
-            .set(TestNamespace::Users, "key1", entry)
-            .await
-            .unwrap();
+        store.set("users", "key1", entry).await.unwrap();
 
         // Get the value
-        let result = store.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().value, "value1");
 
         // Remove the value
-        store.remove(TestNamespace::Users, &["key1"]).await.unwrap();
+        store.remove("users", &["key1"]).await.unwrap();
 
         // Should be gone
-        let result = store.get(TestNamespace::Users, "key1").await.unwrap();
+        let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_expired_entry_removed() {
-        let store: MokaStore<TestNamespace, String> = MokaStore::new(MokaStoreConfig::default());
+        let store: MokaStore<String> = MokaStore::new(MokaStoreConfig::default());
 
         // Set a value that's already expired
         let now = now_ms();
         let entry = Entry::new("value1".to_string(), now - 1000, now - 500);
-        store
-            .set(TestNamespace::Users, "expired_key", entry)
-            .await
-            .unwrap();
+        store.set("users", "expired_key", entry).await.unwrap();
 
         // Should return None and remove the entry
-        let result = store
-            .get(TestNamespace::Users, "expired_key")
-            .await
-            .unwrap();
+        let result = store.get("users", "expired_key").await.unwrap();
         assert!(result.is_none());
 
         // Verify it was removed
-        let result = store
-            .get(TestNamespace::Users, "expired_key")
-            .await
-            .unwrap();
+        let result = store.get("users", "expired_key").await.unwrap();
         assert!(result.is_none());
     }
 }
