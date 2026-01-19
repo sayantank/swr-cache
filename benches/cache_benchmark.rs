@@ -29,6 +29,7 @@ async fn setup_hashmap_redis(redis_url: &str) -> Namespace<BenchNamespace, Bench
     let hashmap = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
     let redis_config = RedisStoreConfig {
         url: redis_url.to_string(),
+        disable_expiration: false,
     };
     let redis: Arc<dyn Store<BenchNamespace, BenchUser>> = Arc::new(
         RedisStore::new(redis_config)
@@ -48,6 +49,7 @@ async fn setup_moka_redis(redis_url: &str) -> Namespace<BenchNamespace, BenchUse
     }));
     let redis_config = RedisStoreConfig {
         url: redis_url.to_string(),
+        disable_expiration: false,
     };
     let redis: Arc<dyn Store<BenchNamespace, BenchUser>> = Arc::new(
         RedisStore::new(redis_config)

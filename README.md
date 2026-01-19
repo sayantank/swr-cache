@@ -164,15 +164,46 @@ Redis-backed cache with TTL support:
 ```rust
 let config = RedisStoreConfig {
     url: "redis://user:password@localhost:6379/0".to_string(),
+    disable_expiration: false,  // Enable Redis TTL (default)
 };
 let store = RedisStore::new(config).await?;
 ```
 
 **Features:**
 - Values stored as JSON
-- Automatic TTL using `SETEX`
+- Automatic TTL using `SETEX` (when `disable_expiration = false`)
 - Async connection pooling
 - Automatic expiration cleanup
+- **Optional no-expiration mode** for resilience during origin outages
+
+**No-Expiration Mode:**
+
+When `disable_expiration: true`, data persists in Redis indefinitely and serves as fallback during origin failures:
+
+```rust
+let config = RedisStoreConfig {
+    url: "redis://localhost:6379".to_string(),
+    disable_expiration: true,  // Data never expires in Redis
+};
+let store = RedisStore::new(config).await?;
+```
+
+**Behavior by data state:**
+
+- **Fresh data** (`now < fresh_until`): Returned immediately
+- **Stale data** (`fresh_until <= now < stale_until`): Returned immediately, revalidated in background
+- **Expired data** (`now >= stale_until`):
+  - Origin is tried synchronously
+  - If origin succeeds → fresh data returned and cached
+  - If origin fails → expired data returned as fallback
+
+This ensures data is always available, even during extended outages.
+
+**Use this mode when:**
+- Origin service has reliability issues
+- Serving stale data is better than serving no data
+- You want maximum resilience during outages
+- Your use case can tolerate slightly outdated data during failures
 
 #### 5. **TieredStore** (`src/tiered.rs`)
 
@@ -277,6 +308,7 @@ let moka = Arc::new(MokaStore::new(MokaStoreConfig {
 
 let redis = Arc::new(RedisStore::new(RedisStoreConfig {
     url: "redis://localhost:6379".to_string(),
+    disable_expiration: false,  // Use Redis TTL
 }).await?);
 
 let cache = Namespace::new(vec![moka, redis], 60_000, 300_000);
@@ -286,7 +318,41 @@ let cache = Namespace::new(vec![moka, redis], 60_000, 300_000);
 // After L1 eviction: hit L2, populate L1 in background
 ```
 
-### Pattern 4: Namespace-Specific Configurations
+### Pattern 4: Resilient Cache with No-Expiration Redis
+
+For critical services that must always serve data, even if stale:
+
+```rust
+let memory = Arc::new(MokaStore::new(MokaStoreConfig {
+    max_capacity: 1_000,
+    time_to_live: Some(Duration::from_secs(300)),
+    time_to_idle: None,
+}));
+
+let redis = Arc::new(RedisStore::new(RedisStoreConfig {
+    url: "redis://localhost:6379".to_string(),
+    disable_expiration: true,  // Keep stale data forever
+}).await?);
+
+let cache = Namespace::new(vec![memory, redis], 60_000, 300_000);
+
+// During normal operation:
+// - Fresh data served from memory (L1)
+// - Stale data triggers background revalidation
+// - Expired data tries origin, serves fallback if origin fails
+//
+// During origin outage:
+// - Fresh/stale data continues to work normally
+// - Expired data: origin fails → serves expired data from Redis
+// - Service continues with outdated data instead of errors
+//
+// After origin recovery:
+// - Next origin attempt succeeds
+// - Fresh data replaces expired data
+// - Service returns to normal
+```
+
+### Pattern 5: Namespace-Specific Configurations
 
 ```rust
 // Users: short cache lifetime
@@ -463,6 +529,32 @@ let allowed = cache.swr(Namespace::RateLimit, client_id, |id| async {
 - Probabilistic revalidation balances freshness/performance
 - Reduces load on rate limiter
 
+### 5. Critical Data with Resilient Caching
+
+For services where serving stale data is better than errors:
+
+```rust
+// Configure Redis to never expire data
+let redis = Arc::new(RedisStore::new(RedisStoreConfig {
+    url: "redis://localhost:6379".to_string(),
+    disable_expiration: true,  // Keep stale data forever
+}).await?);
+
+let cache = Namespace::new(vec![redis], 60_000, 300_000);
+
+// Cache critical configuration or pricing data
+let config = cache.swr(Namespace::Config, "app_config", |_| async {
+    fetch_config_from_api().await  // May fail sometimes
+}).await?;
+```
+
+**Benefits:**
+- Always have data to serve, even if origin is down for extended periods
+- Expired data serves as fallback when origin fails
+- Fresh data returned immediately when origin recovers
+- Stale data continues to revalidate in background
+- Perfect for: pricing data, feature flags, configuration, product catalogs
+
 ## Performance Characteristics
 
 ### HashMapStore
@@ -513,7 +605,10 @@ let moka = Arc::new(MokaStore::new(MokaStoreConfig {
     time_to_idle: None,
 }));
 
-let redis = Arc::new(RedisStore::new(config).await?);
+let redis = Arc::new(RedisStore::new(RedisStoreConfig {
+    url: "redis://localhost:6379".to_string(),
+    disable_expiration: false,
+}).await?);
 
 let cache = Namespace::new(vec![moka, redis], 30_000, 180_000);
 ```
@@ -529,7 +624,10 @@ let moka = Arc::new(MokaStore::new(MokaStoreConfig {
     time_to_idle: None,
 }));
 
-let redis = Arc::new(RedisStore::new(config).await?);
+let redis = Arc::new(RedisStore::new(RedisStoreConfig {
+    url: "redis://localhost:6379".to_string(),
+    disable_expiration: false,
+}).await?);
 
 let cache = Namespace::new(vec![moka, redis], 60_000, 600_000);
 ```
