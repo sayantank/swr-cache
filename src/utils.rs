@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// Format: `{namespace}::{key}`
 pub fn build_cache_key<N: Display + ?Sized>(namespace: &N, key: &str) -> String {
-    format!("{}::{}", namespace, key)
+    format!("{}:{}", namespace, key)
 }
 
 /// Get the current time in milliseconds since UNIX epoch.
@@ -42,7 +42,7 @@ mod tests {
     #[test]
     fn test_build_cache_key() {
         let key = build_cache_key(&"users", "user:123");
-        assert_eq!(key, "users::user:123");
+        assert_eq!(key, "users:user:123");
     }
 
     #[test]

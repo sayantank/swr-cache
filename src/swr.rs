@@ -178,17 +178,44 @@ where
 
         tokio::spawn(async move {
             let stored_entry = match storage_mode {
-                StorageMode::Typed => StoredEntry::from_typed(value, fresh_until, stale_until),
+                StorageMode::Typed => {
+                    StoredEntry::from_typed_with_serializer(value, fresh_until, stale_until)
+                }
                 StorageMode::Serialized => {
                     match serde_json::to_string(&Entry::new(value, fresh_until, stale_until)) {
                         Ok(json_data) => {
                             StoredEntry::from_serialized(json_data, fresh_until, stale_until)
                         }
-                        Err(_) => return, // Skip caching on serialization error
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to serialize value for background caching: namespace={}, key={}, error={}",
+                                namespace,
+                                key,
+                                e
+                            );
+                            return; // Skip caching on serialization error
+                        }
                     }
                 }
             };
-            let _ = store.set(&namespace, &key, stored_entry).await;
+
+            match store.set(&namespace, &key, stored_entry).await {
+                Ok(_) => {
+                    tracing::debug!(
+                        "Successfully cached value in background: namespace={}, key={}",
+                        namespace,
+                        key
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to cache value in background: namespace={}, key={}, error={}",
+                        namespace,
+                        key,
+                        e
+                    );
+                }
+            }
         });
     }
 
@@ -336,7 +363,9 @@ where
                 let stale_until = now + stale_ms;
 
                 let stored_entry = match storage_mode {
-                    StorageMode::Typed => StoredEntry::from_typed(v, fresh_until, stale_until),
+                    StorageMode::Typed => {
+                        StoredEntry::from_typed_with_serializer(v, fresh_until, stale_until)
+                    }
                     StorageMode::Serialized => {
                         match serde_json::to_string(&Entry::new(v, fresh_until, stale_until)) {
                             Ok(json_data) => {
@@ -351,7 +380,24 @@ where
                         }
                     }
                 };
-                let _ = store.set(&namespace, &key, stored_entry).await;
+
+                match store.set(&namespace, &key, stored_entry).await {
+                    Ok(_) => {
+                        tracing::debug!(
+                            "Successfully updated cache during revalidation: namespace={}, key={}",
+                            namespace,
+                            key
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to update cache during revalidation: namespace={}, key={}, error={}",
+                            namespace,
+                            key,
+                            e
+                        );
+                    }
+                }
             }
 
             // Remove from revalidating

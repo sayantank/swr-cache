@@ -79,9 +79,28 @@ impl Store for TieredStore {
                             if let Ok(converted_entry) =
                                 entry_clone.clone().convert_for_mode(target_mode)
                             {
-                                let _ = tier
+                                match tier
                                     .set(&namespace_clone, &key_clone, converted_entry)
-                                    .await;
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        tracing::debug!(
+                                            "Successfully populated lower tier: tier={}, namespace={}, key={}",
+                                            tier.name(),
+                                            namespace_clone,
+                                            key_clone
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to populate lower tier: tier={}, namespace={}, key={}, error={}",
+                                            tier.name(),
+                                            namespace_clone,
+                                            key_clone,
+                                            e
+                                        );
+                                    }
+                                }
                             }
                         }
                     });

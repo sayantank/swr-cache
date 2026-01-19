@@ -635,6 +635,93 @@ async fn test_tiered_moka_redis_serialization_correctness() {
     cache.remove(&test_key).await.unwrap();
 }
 
+#[tokio::test]
+async fn test_tiered_store_origin_load_populates_all_tiers() {
+    let moka_store: Arc<dyn Store> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
+    let redis_store: Arc<dyn Store> = Arc::new(create_redis_store().await);
+
+    let cache = Cache::new(
+        "users",
+        vec![moka_store.clone(), redis_store.clone()],
+        60_000,
+        300_000,
+    );
+
+    let test_key = format!("user:origin_population_{}", now_ms());
+
+    let db = fake_user_db();
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    // Verify both stores are empty initially
+    let l1_initial = moka_store.get("users", &test_key).await.unwrap();
+    let l2_initial = redis_store.get("users", &test_key).await.unwrap();
+    assert!(l1_initial.is_none(), "L1 should be empty initially");
+    assert!(l2_initial.is_none(), "L2 should be empty initially");
+
+    // Call swr - should load from origin (cache miss)
+    let call_count_clone = call_count.clone();
+    let db_clone = db.clone();
+    let result = cache
+        .swr(&test_key, move |_key| {
+            let db = db_clone.clone();
+            let count = call_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                db.get("user:1").cloned()
+            }
+        })
+        .await
+        .unwrap();
+
+    // Should get result from origin
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().name, "Alice");
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+    // Wait for background caching to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+    // Verify BOTH L1 and L2 are now populated
+    let l1_result = moka_store.get("users", &test_key).await.unwrap();
+    assert!(
+        l1_result.is_some(),
+        "L1 (Moka) should be populated after origin load"
+    );
+    let l1_user: Entry<User> = l1_result.unwrap().into_typed().unwrap();
+    assert_eq!(l1_user.value.name, "Alice");
+
+    let l2_result = redis_store.get("users", &test_key).await.unwrap();
+    assert!(
+        l2_result.is_some(),
+        "L2 (Redis) should be populated after origin load"
+    );
+    let l2_user: Entry<User> = l2_result.unwrap().into_typed().unwrap();
+    assert_eq!(l2_user.value.name, "Alice");
+
+    // Second call should hit cache (not call origin again)
+    let call_count_clone = call_count.clone();
+    let db_clone = db.clone();
+    let result = cache
+        .swr(&test_key, move |_key| {
+            let db = db_clone.clone();
+            let count = call_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                db.get("user:1").cloned()
+            }
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().name, "Alice");
+    // Origin should still only have been called once
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+    // Cleanup
+    cache.remove(&test_key).await.unwrap();
+}
+
 // ============================================================================
 // Redis Store No-Expiration Tests
 // ============================================================================
