@@ -520,6 +520,121 @@ async fn test_tiered_store_with_namespace_swr() {
     cache.remove(&test_key).await.unwrap();
 }
 
+#[tokio::test]
+async fn test_tiered_moka_redis_serialization_correctness() {
+    // This test validates that MokaStore (Typed) + RedisStore (Serialized)
+    // properly serializes values instead of storing "Any { .. }"
+
+    let moka_store: Arc<dyn Store> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
+    let redis_store: Arc<dyn Store> = Arc::new(create_redis_store().await);
+
+    let cache = Cache::new(
+        "users",
+        vec![moka_store.clone(), redis_store.clone()],
+        60_000,
+        300_000,
+    );
+
+    let test_key = format!("user:serialization_test_{}", now_ms());
+
+    let user = User {
+        id: 999,
+        name: "Serialization Test User".into(),
+        email: "serialize@example.com".into(),
+    };
+
+    // Write through the cache (this triggers TieredStore.set())
+    cache.set(&test_key, user.clone()).await.unwrap();
+
+    // Wait for caching to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Directly query Redis to get the raw JSON string
+    let raw_result = redis_store.get("users", &test_key).await.unwrap();
+    assert!(
+        raw_result.is_some(),
+        "Entry should exist in Redis after cache.set()"
+    );
+
+    // Extract the raw JSON data
+    let stored_entry = raw_result.unwrap();
+    let json_str = match stored_entry {
+        StoredEntry::Serialized { data, .. } => data,
+        StoredEntry::Typed { .. } => {
+            panic!("Redis should store Serialized entries, not Typed")
+        }
+    };
+
+    // Parse the JSON to validate structure
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json_str).expect("Stored data should be valid JSON");
+
+    // Validate that we have the expected Entry<User> structure
+    assert!(
+        parsed.get("value").is_some(),
+        "JSON should have 'value' field"
+    );
+    assert!(
+        parsed.get("fresh_until").is_some(),
+        "JSON should have 'fresh_until' field"
+    );
+    assert!(
+        parsed.get("stale_until").is_some(),
+        "JSON should have 'stale_until' field"
+    );
+
+    // Validate that the value is a properly serialized User, not "Any { .. }"
+    let value_obj = parsed.get("value").unwrap();
+    assert!(
+        value_obj.is_object(),
+        "value field should be an object, not a string like 'Any {{ .. }}'"
+    );
+
+    let value_str = value_obj.to_string();
+    assert!(
+        !value_str.contains("Any"),
+        "Serialized value should not contain 'Any {{ .. }}', got: {}",
+        value_str
+    );
+
+    // Validate the User fields are properly serialized
+    assert_eq!(
+        value_obj.get("id").and_then(|v| v.as_u64()),
+        Some(999),
+        "User id should be properly serialized"
+    );
+    assert_eq!(
+        value_obj.get("name").and_then(|v| v.as_str()),
+        Some("Serialization Test User"),
+        "User name should be properly serialized"
+    );
+    assert_eq!(
+        value_obj.get("email").and_then(|v| v.as_str()),
+        Some("serialize@example.com"),
+        "User email should be properly serialized"
+    );
+
+    // Test round-trip: Clear L1 (Moka), then read from cache
+    // This should retrieve from L2 (Redis) and deserialize properly
+    moka_store.remove("users", &[&test_key]).await.unwrap();
+
+    // Verify L1 is empty
+    let l1_result = moka_store.get("users", &test_key).await.unwrap();
+    assert!(l1_result.is_none(), "L1 should be empty after removal");
+
+    // Read from cache - should hit L2 (Redis) and deserialize correctly
+    let retrieved = cache.get(&test_key).await.unwrap();
+    assert!(retrieved.is_some(), "Should retrieve value from L2 (Redis)");
+
+    let retrieved_user = retrieved.unwrap();
+    assert_eq!(retrieved_user.id, user.id, "User id should match");
+    assert_eq!(retrieved_user.name, user.name, "User name should match");
+    assert_eq!(retrieved_user.email, user.email, "User email should match");
+
+    // Cleanup
+    cache.remove(&test_key).await.unwrap();
+}
+
 // ============================================================================
 // Redis Store No-Expiration Tests
 // ============================================================================

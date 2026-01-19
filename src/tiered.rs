@@ -74,9 +74,15 @@ impl Store for TieredStore {
 
                     tokio::spawn(async move {
                         for tier in lower_tiers {
-                            let _ = tier
-                                .set(&namespace_clone, &key_clone, entry_clone.clone())
-                                .await;
+                            // Convert entry to match tier's storage mode
+                            let target_mode = tier.storage_mode();
+                            if let Ok(converted_entry) =
+                                entry_clone.clone().convert_for_mode(target_mode)
+                            {
+                                let _ = tier
+                                    .set(&namespace_clone, &key_clone, converted_entry)
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -89,7 +95,7 @@ impl Store for TieredStore {
     }
 
     async fn set(&self, namespace: &str, key: &str, entry: StoredEntry) -> Result<(), CacheError> {
-        // Set on all tiers in parallel
+        // Set on all tiers in parallel, converting entry format to match each tier's storage mode
         let futures: Vec<_> = self
             .tiers
             .iter()
@@ -98,7 +104,13 @@ impl Store for TieredStore {
                 let namespace = namespace.to_string();
                 let key = key.to_string();
                 let entry = entry.clone();
-                async move { tier.set(&namespace, &key, entry).await }
+                let target_mode = tier.storage_mode();
+
+                async move {
+                    // Convert entry to match tier's storage mode
+                    let converted_entry = entry.convert_for_mode(target_mode)?;
+                    tier.set(&namespace, &key, converted_entry).await
+                }
             })
             .collect();
 

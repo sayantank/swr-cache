@@ -155,23 +155,18 @@ impl Store for RedisStore {
         let cache_key = build_cache_key(namespace, key);
         let mut conn = self.connection.clone();
 
-        // Convert to Serialized format if needed
+        // RedisStore only accepts Serialized entries
+        // TieredStore handles conversion based on storage_mode()
         let (json_str, stale_until) = match entry {
             StoredEntry::Serialized {
                 data, stale_until, ..
             } => (data, stale_until),
-            StoredEntry::Typed {
-                value,
-                fresh_until,
-                stale_until,
-            } => {
-                // Need to serialize the typed value - create a temporary JSON with metadata
-                let json_value = serde_json::json!({
-                    "value": format!("{:?}", value), // This is a fallback; proper handling in SwrCache
-                    "fresh_until": fresh_until,
-                    "stale_until": stale_until,
-                });
-                (json_value.to_string(), stale_until)
+            StoredEntry::Typed { .. } => {
+                return Err(CacheError::Serialization(
+                    "RedisStore received Typed entry but requires Serialized. \
+                     This indicates a bug in TieredStore conversion logic."
+                        .to_string(),
+                ));
             }
         };
 

@@ -143,8 +143,11 @@ where
         let stale_ms = opts.as_ref().map(|o| o.stale_ms).unwrap_or(self.stale_ms);
 
         // Convert to StoredEntry based on store's preference
+        // Always use from_typed_with_serializer to support tiered caches with mixed storage modes
         let stored_entry = match self.store.storage_mode() {
-            StorageMode::Typed => StoredEntry::from_typed(value, now + fresh_ms, now + stale_ms),
+            StorageMode::Typed => {
+                StoredEntry::from_typed_with_serializer(value, now + fresh_ms, now + stale_ms)
+            }
             StorageMode::Serialized => {
                 let json_data =
                     serde_json::to_string(&Entry::new(value, now + fresh_ms, now + stale_ms))
