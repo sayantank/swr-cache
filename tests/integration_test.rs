@@ -690,10 +690,11 @@ async fn test_redis_store_disable_expiration_with_swr_resilience() {
     // Should still get the stale data
     assert!(result.is_some(), "Stale data should be returned");
     assert_eq!(result.unwrap().name, "Resilient User");
-    assert_eq!(call_count.load(Ordering::SeqCst), 2);
 
     // Wait for background revalidation to complete (which fails)
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
 
     // Wait for stale_until to pass (1000ms total)
     tokio::time::sleep(tokio::time::Duration::from_millis(900)).await;
