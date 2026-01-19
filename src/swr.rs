@@ -18,6 +18,7 @@ type RevalidationState<V> =
 struct GetResult<V> {
     value: Option<V>,
     revalidate: bool,
+    is_expired: bool,
 }
 
 /// Options for setting cache entries.
@@ -92,6 +93,7 @@ where
             return Ok(GetResult {
                 value: None,
                 revalidate: false,
+                is_expired: false,
             });
         };
 
@@ -99,17 +101,12 @@ where
 
         // Entry has completely expired
         if now >= entry.stale_until {
-            // Remove in background
-            let store = self.store.clone();
-            let namespace = namespace.clone();
-            let key = key.to_string();
-            tokio::spawn(async move {
-                let _ = store.remove(namespace, &[&key]).await;
-            });
-
+            // Don't remove - let it serve as fallback
+            // Store implementations with disable_expiration will handle this
             return Ok(GetResult {
-                value: None,
-                revalidate: false,
+                value: Some(entry.value),
+                revalidate: true,
+                is_expired: true,
             });
         }
 
@@ -118,6 +115,7 @@ where
             return Ok(GetResult {
                 value: Some(entry.value),
                 revalidate: true,
+                is_expired: false,
             });
         }
 
@@ -125,6 +123,7 @@ where
         Ok(GetResult {
             value: Some(entry.value),
             revalidate: false,
+            is_expired: false,
         })
     }
 
@@ -147,6 +146,18 @@ where
     /// Removes the key from the cache.
     pub async fn remove(&self, namespace: N, key: &str) -> Result<(), CacheError> {
         self.store.remove(namespace, &[key]).await
+    }
+
+    /// Cache a value in the background.
+    fn cache_value(&self, namespace: N, key: &str, value: V) {
+        let store = self.store.clone();
+        let key = key.to_string();
+        let now = now_ms();
+        let entry = Entry::new(value, now + self.fresh_ms, now + self.stale_ms);
+
+        tokio::spawn(async move {
+            let _ = store.set(namespace, &key, entry).await;
+        });
     }
 
     /// Stale-while-revalidate: Get the cached value or load from origin.
@@ -176,17 +187,60 @@ where
             Ok(GetResult {
                 value: Some(value),
                 revalidate: true,
+                is_expired: false,
             }) => {
-                // Return stale value, but revalidate in background
+                // Return stale value, revalidate in background
                 self.spawn_revalidation(namespace.clone(), key, load_from_origin);
                 Ok(Some(value))
             }
             Ok(GetResult {
                 value: Some(value),
+                revalidate: true,
+                is_expired: true,
+            }) => {
+                // Expired data - try origin synchronously, fallback to expired
+                match self
+                    .deduplicated_load_from_origin(namespace.clone(), key, load_from_origin)
+                    .await
+                {
+                    Ok(Some(fresh_value)) => {
+                        // Origin succeeded - cache and return fresh
+                        self.cache_value(namespace, key, fresh_value.clone());
+                        Ok(Some(fresh_value))
+                    }
+                    Ok(None) | Err(_) => {
+                        // Origin failed - return expired data as fallback
+                        Ok(Some(value))
+                    }
+                }
+            }
+            Ok(GetResult {
+                value: Some(value),
                 revalidate: false,
+                is_expired: false,
             }) => {
                 // Return fresh value
                 Ok(Some(value))
+            }
+            Ok(GetResult {
+                value: Some(_),
+                revalidate: false,
+                is_expired: true,
+            }) => {
+                // This shouldn't happen (expired should always trigger revalidation)
+                // but handle it defensively by treating as cache miss
+                match self
+                    .deduplicated_load_from_origin(namespace.clone(), key, load_from_origin)
+                    .await
+                {
+                    Ok(value) => {
+                        if let Some(ref v) = value {
+                            self.cache_value(namespace.clone(), key, v.clone());
+                        }
+                        Ok(value)
+                    }
+                    Err(e) => Err(CacheError::operation(self.store.name(), key, e.to_string())),
+                }
             }
             Ok(GetResult { value: None, .. }) | Err(_) => {
                 // Cache miss or error - load from origin
@@ -197,16 +251,7 @@ where
                     Ok(value) => {
                         // Cache in background
                         if let Some(ref v) = value {
-                            let store = self.store.clone();
-                            let namespace = namespace.clone();
-                            let key = key.to_string();
-                            let now = now_ms();
-                            let entry =
-                                Entry::new(v.clone(), now + self.fresh_ms, now + self.stale_ms);
-
-                            tokio::spawn(async move {
-                                let _ = store.set(namespace, &key, entry).await;
-                            });
+                            self.cache_value(namespace.clone(), key, v.clone());
                         }
                         Ok(value)
                     }

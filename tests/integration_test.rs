@@ -84,6 +84,7 @@ fn now_ms() -> i64 {
 async fn create_redis_store() -> RedisStore<TestNamespace, User> {
     let config = RedisStoreConfig {
         url: "redis://localhost:6379".to_string(),
+        disable_expiration: false,
     };
     RedisStore::new(config)
         .await
@@ -550,6 +551,315 @@ async fn test_tiered_store_with_namespace_swr() {
     assert_eq!(result.unwrap().name, "Charlie");
     // Origin should still only have been called once
     assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+    // Cleanup
+    cache.remove(TestNamespace::Users, &test_key).await.unwrap();
+}
+
+// ============================================================================
+// Redis Store No-Expiration Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_redis_store_disable_expiration_preserves_stale_data() {
+    // Create Redis store with expiration disabled
+    let config = RedisStoreConfig {
+        url: "redis://localhost:6379".to_string(),
+        disable_expiration: true,
+    };
+    let store: Arc<dyn Store<TestNamespace, User>> = Arc::new(
+        RedisStore::new(config)
+            .await
+            .expect("Failed to connect to Redis"),
+    );
+
+    let test_key = format!("user:no_expire_{}", now_ms());
+
+    let user = User {
+        id: 300,
+        name: "Stale User".into(),
+        email: "stale@example.com".into(),
+    };
+
+    // Set entry with very short TTL (1 second stale_until)
+    let now = now_ms();
+    let entry = Entry::new(user.clone(), now - 1000, now + 1000); // fresh_until in past, stale_until 1s from now
+    store
+        .set(TestNamespace::Users, &test_key, entry)
+        .await
+        .unwrap();
+
+    // Wait for stale_until to pass
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+    // With disable_expiration=true, the entry should still exist in Redis
+    // and get() should return it for fallback purposes
+    let result = store.get(TestNamespace::Users, &test_key).await.unwrap();
+    assert!(
+        result.is_some(),
+        "get() should return expired entry when disable_expiration is true"
+    );
+    assert_eq!(
+        result.unwrap().value.name,
+        "Stale User",
+        "Expired entry value should match"
+    );
+
+    // However, if we query Redis directly, the data should still be there
+    // Let's verify by setting a new entry and checking it persists
+    let now = now_ms();
+    let entry2 = Entry::new(user.clone(), now + 60_000, now + 300_000);
+    store
+        .set(TestNamespace::Users, &test_key, entry2)
+        .await
+        .unwrap();
+
+    let result = store.get(TestNamespace::Users, &test_key).await.unwrap();
+    assert!(result.is_some(), "Fresh entry should be retrievable");
+
+    // Cleanup
+    store
+        .remove(TestNamespace::Users, &[&test_key])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_redis_store_disable_expiration_with_swr_resilience() {
+    // Create Redis store with expiration disabled
+    let config = RedisStoreConfig {
+        url: "redis://localhost:6379".to_string(),
+        disable_expiration: true,
+    };
+    let store: Arc<dyn Store<TestNamespace, User>> = Arc::new(
+        RedisStore::new(config)
+            .await
+            .expect("Failed to connect to Redis"),
+    );
+
+    let cache = Namespace::new(vec![store.clone()], 100, 1000); // 100ms fresh, 1000ms stale
+
+    let test_key = format!("user:swr_resilient_{}", now_ms());
+
+    let user = User {
+        id: 400,
+        name: "Resilient User".into(),
+        email: "resilient@example.com".into(),
+    };
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    // First call - cache miss, loads from origin
+    let call_count_clone = call_count.clone();
+    let user_clone = user.clone();
+    let result = cache
+        .swr(TestNamespace::Users, &test_key, move |_key| {
+            let count = call_count_clone.clone();
+            let u = user_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Some(u)
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.as_ref().unwrap().name, "Resilient User");
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+    // Wait for background caching
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Wait for data to become stale (but not expired)
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Second call - data is stale, should return stale data and revalidate
+    // Origin fails this time
+    let call_count_clone = call_count.clone();
+    let result = cache
+        .swr(TestNamespace::Users, &test_key, move |_key| {
+            let count = call_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                None // Origin fails!
+            }
+        })
+        .await
+        .unwrap();
+
+    // Should still get the stale data
+    assert!(result.is_some(), "Stale data should be returned");
+    assert_eq!(result.unwrap().name, "Resilient User");
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
+
+    // Wait for background revalidation to complete (which fails)
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Wait for stale_until to pass (1000ms total)
+    tokio::time::sleep(tokio::time::Duration::from_millis(900)).await;
+
+    // Third call - data has expired, but with disable_expiration it's still in Redis
+    // Even though it's expired, it won't be auto-deleted from Redis
+    // However, the application layer will consider it expired and try to load from origin
+    let call_count_clone = call_count.clone();
+    let user_clone = user.clone();
+    let result = cache
+        .swr(TestNamespace::Users, &test_key, move |_key| {
+            let count = call_count_clone.clone();
+            let u = user_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Some(u) // Origin succeeds again
+            }
+        })
+        .await
+        .unwrap();
+
+    // Should get data from origin
+    assert_eq!(result.as_ref().unwrap().name, "Resilient User");
+    assert_eq!(call_count.load(Ordering::SeqCst), 3);
+
+    // Cleanup
+    cache.remove(TestNamespace::Users, &test_key).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_redis_store_with_expiration_enabled_deletes_stale_data() {
+    // Create Redis store with expiration ENABLED (default behavior)
+    let config = RedisStoreConfig {
+        url: "redis://localhost:6379".to_string(),
+        disable_expiration: false,
+    };
+    let store: Arc<dyn Store<TestNamespace, User>> = Arc::new(
+        RedisStore::new(config)
+            .await
+            .expect("Failed to connect to Redis"),
+    );
+
+    let test_key = format!("user:with_expire_{}", now_ms());
+
+    let user = User {
+        id: 500,
+        name: "Expiring User".into(),
+        email: "expiring@example.com".into(),
+    };
+
+    // Set entry with very short TTL (2 second stale_until)
+    let now = now_ms();
+    let entry = Entry::new(user.clone(), now + 100, now + 2000);
+    store
+        .set(TestNamespace::Users, &test_key, entry)
+        .await
+        .unwrap();
+
+    // Immediately after setting, should be retrievable
+    let result = store.get(TestNamespace::Users, &test_key).await.unwrap();
+    assert!(result.is_some(), "Fresh entry should be retrievable");
+
+    // Wait for Redis TTL to expire (2+ seconds)
+    tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+
+    // With disable_expiration=false, Redis should have auto-deleted the entry
+    let result = store.get(TestNamespace::Users, &test_key).await.unwrap();
+    assert!(
+        result.is_none(),
+        "Entry should be auto-deleted by Redis after TTL"
+    );
+
+    // Cleanup (in case it still exists)
+    let _ = store.remove(TestNamespace::Users, &[&test_key]).await;
+}
+
+#[tokio::test]
+async fn test_redis_no_expire_returns_expired_data_when_origin_fails() {
+    let config = RedisStoreConfig {
+        url: "redis://localhost:6379".to_string(),
+        disable_expiration: true,
+    };
+    let store: Arc<dyn Store<TestNamespace, User>> = Arc::new(
+        RedisStore::new(config)
+            .await
+            .expect("Failed to connect to Redis"),
+    );
+    let cache = Namespace::new(vec![store], 100, 500); // 100ms fresh, 500ms stale
+
+    let test_key = format!("user:fallback_test_{}", now_ms());
+    let user = User {
+        id: 999,
+        name: "Fallback User".into(),
+        email: "fallback@example.com".into(),
+    };
+
+    // 1. Initial load from origin
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_clone = call_count.clone();
+    let user_clone = user.clone();
+
+    let result = cache
+        .swr(TestNamespace::Users, &test_key, move |_| {
+            let count = call_count_clone.clone();
+            let u = user_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Some(u)
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.as_ref().unwrap().name, "Fallback User");
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+    // Wait for background caching
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // 2. Wait for data to expire (>500ms)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // 3. Origin fails, should return expired data as fallback
+    let call_count_clone = call_count.clone();
+    let result = cache
+        .swr(TestNamespace::Users, &test_key, move |_| {
+            let count = call_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                None // Origin fails!
+            }
+        })
+        .await
+        .unwrap();
+
+    // Should still get the expired data
+    assert!(
+        result.is_some(),
+        "Expired data should be returned as fallback"
+    );
+    assert_eq!(result.unwrap().name, "Fallback User");
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
+
+    // 4. Origin succeeds, should return fresh data
+    let call_count_clone = call_count.clone();
+    let updated_user = User {
+        id: 999,
+        name: "Updated User".into(),
+        email: "updated@example.com".into(),
+    };
+    let updated_clone = updated_user.clone();
+
+    let result = cache
+        .swr(TestNamespace::Users, &test_key, move |_| {
+            let count = call_count_clone.clone();
+            let u = updated_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Some(u)
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.as_ref().unwrap().name, "Updated User");
+    assert_eq!(call_count.load(Ordering::SeqCst), 3);
 
     // Cleanup
     cache.remove(TestNamespace::Users, &test_key).await.unwrap();

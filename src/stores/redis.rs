@@ -24,11 +24,26 @@ pub struct RedisStoreConfig {
     /// - `redis://user:password@localhost:6379/0`
     /// - `rediss://user:password@host:6379` (TLS)
     pub url: String,
+
+    /// If true, data never expires in Redis (no TTL set).
+    ///
+    /// This is useful for keeping stale data available even when the origin fails.
+    /// When disabled, stale data persists in Redis and can be served during revalidation,
+    /// providing resilience during origin outages.
+    ///
+    /// Note: The application still tracks `stale_until` timestamps and considers
+    /// entries stale/expired based on these values, but Redis won't auto-evict them.
+    ///
+    /// Default: `false` (expiration enabled, Redis auto-evicts after TTL)
+    pub disable_expiration: bool,
 }
 
 /// Redis-backed cache store.
 ///
-/// Values are stored as JSON strings with TTL based on `stale_until`.
+/// Values are stored as JSON strings. By default, TTL is set based on `stale_until`.
+/// When `disable_expiration` is enabled, data persists indefinitely in Redis, which is
+/// useful for keeping stale data available during origin outages.
+///
 /// Requires `V` to implement `Serialize` and `DeserializeOwned`.
 pub struct RedisStore<N, V>
 where
@@ -36,6 +51,7 @@ where
     V: Clone + Serialize + DeserializeOwned + Send + Sync,
 {
     connection: MultiplexedConnection,
+    disable_expiration: bool,
     _marker: PhantomData<(N, V)>,
 }
 
@@ -57,6 +73,7 @@ where
     /// ```ignore
     /// let config = RedisStoreConfig {
     ///     url: "redis://localhost:6379".to_string(),
+    ///     disable_expiration: false,
     /// };
     /// let store = RedisStore::new(config).await?;
     /// ```
@@ -74,6 +91,7 @@ where
 
         Ok(RedisStore {
             connection,
+            disable_expiration: config.disable_expiration,
             _marker: PhantomData,
         })
     }
@@ -116,13 +134,18 @@ where
                 // Check if expired
                 let now = now_ms();
                 if now >= entry.stale_until {
-                    // Entry is expired, delete it in background
-                    let mut del_conn = self.connection.clone();
-                    let del_key = cache_key.clone();
-                    tokio::spawn(async move {
-                        let _: Result<(), _> = del_conn.del(del_key).await;
-                    });
-                    return Ok(None);
+                    // Entry is expired
+                    if !self.disable_expiration {
+                        // Delete in background when expiration is enabled
+                        let mut del_conn = self.connection.clone();
+                        let del_key = cache_key.clone();
+                        tokio::spawn(async move {
+                            let _: Result<(), _> = del_conn.del(del_key).await;
+                        });
+                        return Ok(None);
+                    }
+                    // With disable_expiration, return expired entry for potential fallback
+                    return Ok(Some(entry));
                 }
 
                 Ok(Some(entry))
@@ -139,12 +162,20 @@ where
             CacheError::operation("redis", key, format!("Serialization failed: {}", e))
         })?;
 
-        let ttl_seconds = Self::calculate_ttl_seconds(entry.stale_until);
-
-        let _: () = conn
-            .set_ex(&cache_key, json_str, ttl_seconds)
-            .await
-            .map_err(|e| CacheError::operation("redis", key, format!("SETEX failed: {}", e)))?;
+        if self.disable_expiration {
+            // Store without TTL - data persists indefinitely
+            let _: () = conn
+                .set(&cache_key, json_str)
+                .await
+                .map_err(|e| CacheError::operation("redis", key, format!("SET failed: {}", e)))?;
+        } else {
+            // Store with TTL - Redis auto-evicts after expiration
+            let ttl_seconds = Self::calculate_ttl_seconds(entry.stale_until);
+            let _: () = conn
+                .set_ex(&cache_key, json_str, ttl_seconds)
+                .await
+                .map_err(|e| CacheError::operation("redis", key, format!("SETEX failed: {}", e)))?;
+        }
 
         Ok(())
     }
@@ -193,6 +224,7 @@ mod tests {
     async fn test_redis_get_set_remove() {
         let config = RedisStoreConfig {
             url: "redis://localhost:6379".to_string(),
+            disable_expiration: false,
         };
 
         let store: RedisStore<TestNamespace, String> = RedisStore::new(config).await.unwrap();
