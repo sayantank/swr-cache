@@ -26,44 +26,39 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 ## Quick Start
 
 ```rust
-use swr_cache::{Namespace, HashMapStore, HashMapStoreConfig};
+use swr_cache::{CacheBuilder, Namespace, HashMapStore, HashMapStoreConfig};
 use std::sync::Arc;
-
-#[derive(Clone, Hash, Eq, PartialEq)]
-enum CacheNamespace {
-    Users,
-    Products,
-}
-
-impl std::fmt::Display for CacheNamespace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CacheNamespace::Users => write!(f, "users"),
-            CacheNamespace::Products => write!(f, "products"),
-        }
-    }
-}
 
 #[tokio::main]
 async fn main() {
     // Create an in-memory cache
     let memory = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
 
-    // Wrap in a namespace with 1 minute fresh time, 5 minute stale time
-    let cache = Namespace::new(vec![memory], 60_000, 300_000);
+    // Create namespaces with different configurations
+    let users = Namespace::new("users", vec![memory.clone()], 60_000, 300_000);
+    let products = Namespace::new("products", vec![memory], 60_000, 300_000);
 
-    // Use SWR pattern - returns cached value if available, loads from origin if not
-    let user = cache.swr(CacheNamespace::Users, "user:123", |key| async {
-        // Load from database or API
-        fetch_user_from_db(&key).await
+    // Build cache with multiple namespaces
+    let cache = CacheBuilder::new()
+        .add("users", users)
+        .add("products", products)
+        .build();
+
+    // Access specific namespace
+    let users_cache = cache.namespace("users");
+
+    // Use SWR pattern - callback receives the actual key
+    let user = users_cache.swr("user:123", |id| async move {
+        // Load from database or API - 'id' is "user:123"
+        fetch_user_from_db(&id).await
     }).await.unwrap();
 
     println!("User: {:?}", user);
 }
 
-async fn fetch_user_from_db(key: &str) -> Option<String> {
+async fn fetch_user_from_db(id: &str) -> Option<String> {
     // Simulate database lookup
-    Some(format!("User data for {}", key))
+    Some(format!("User data for {}", id))
 }
 ```
 

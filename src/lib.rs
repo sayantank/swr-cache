@@ -9,42 +9,35 @@
 //! # Example
 //!
 //! ```ignore
-//! use swr_cache::{Namespace, HashMapStore, HashMapStoreConfig};
+//! use swr_cache::{CacheBuilder, Namespace, HashMapStore, HashMapStoreConfig};
 //! use std::sync::Arc;
-//!
-//! #[derive(Clone, Hash, Eq, PartialEq)]
-//! enum CacheNamespace {
-//!     Users,
-//!     Sessions,
-//! }
-//!
-//! impl std::fmt::Display for CacheNamespace {
-//!     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//!         match self {
-//!             CacheNamespace::Users => write!(f, "users"),
-//!             CacheNamespace::Sessions => write!(f, "sessions"),
-//!         }
-//!     }
-//! }
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let memory = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
 //!
-//!     let cache = Namespace::new(
-//!         vec![memory],
-//!         60_000,   // 1 minute fresh
-//!         300_000,  // 5 minutes stale
-//!     );
+//!     // Create namespaces
+//!     let users = Namespace::new("users", vec![memory.clone()], 60_000, 300_000);
+//!     let sessions = Namespace::new("sessions", vec![memory], 60_000, 300_000);
 //!
-//!     // SWR pattern - returns cached or fetches from origin
-//!     let user = cache.swr(CacheNamespace::Users, "user:123", |key| async {
-//!         // Load from database or API
-//!         Some(format!("User data for {}", key))
+//!     // Build cache with multiple namespaces
+//!     let cache = CacheBuilder::new()
+//!         .add("users", users)
+//!         .add("sessions", sessions)
+//!         .build();
+//!
+//!     // Access specific namespace
+//!     let users_cache = cache.namespace("users");
+//!
+//!     // SWR pattern - callback receives the actual key
+//!     let user = users_cache.swr("user:123", |id| async move {
+//!         // Load from database - 'id' is "user:123"
+//!         Some(format!("User data for {}", id))
 //!     }).await.unwrap();
 //! }
 //! ```
 
+mod builder;
 mod entry;
 mod error;
 mod namespace;
@@ -55,6 +48,7 @@ mod tiered;
 mod utils;
 
 // Re-export public API
+pub use builder::{Cache, CacheBuilder};
 pub use entry::Entry;
 pub use error::CacheError;
 pub use namespace::Namespace;
