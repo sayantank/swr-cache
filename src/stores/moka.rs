@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use moka::future::Cache;
 use std::time::Duration;
 
-use crate::entry::Entry;
+use crate::entry::{StorageMode, StoredEntry};
 use crate::error::CacheError;
 use crate::store::Store;
 use crate::utils::{build_cache_key, now_ms};
@@ -40,21 +40,19 @@ impl Default for MokaStoreConfig {
 /// - Excellent performance under high concurrency (>8 threads)
 /// - Suitable for large cache sizes (>10,000 items)
 ///
+/// MokaStore is type-agnostic and can store values of any type.
+/// It prefers `StoredEntry::Typed` for zero-copy storage but can handle
+/// both typed and serialized entries.
+///
 /// Use this store for production workloads requiring:
 /// - High throughput
 /// - Low P99 latency
 /// - Predictable performance under load
-pub struct MokaStore<V>
-where
-    V: Clone + Send + Sync,
-{
-    cache: Cache<String, Entry<V>>,
+pub struct MokaStore {
+    cache: Cache<String, StoredEntry>,
 }
 
-impl<V> MokaStore<V>
-where
-    V: Clone + Send + Sync + 'static,
-{
+impl MokaStore {
     /// Create a new MokaStore with the given configuration.
     ///
     /// # Example
@@ -91,15 +89,16 @@ where
 }
 
 #[async_trait]
-impl<V> Store<V> for MokaStore<V>
-where
-    V: Clone + Send + Sync + 'static,
-{
+impl Store for MokaStore {
     fn name(&self) -> &'static str {
         "moka"
     }
 
-    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Entry<V>>, CacheError> {
+    fn storage_mode(&self) -> StorageMode {
+        StorageMode::Typed
+    }
+
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<StoredEntry>, CacheError> {
         let cache_key = build_cache_key(namespace, key);
 
         match self.cache.get(&cache_key).await {
@@ -107,19 +106,20 @@ where
                 let now = now_ms();
 
                 // Check if expired based on our Entry timestamps
-                if now >= entry.stale_until {
+                if entry.is_expired(now) {
                     // Entry is expired, remove it
                     self.cache.invalidate(&cache_key).await;
                     return Ok(None);
                 }
 
-                Ok(Some(entry))
+                // Clone the StoredEntry (cheap for Typed variant with Arc)
+                Ok(Some(entry.clone()))
             }
             None => Ok(None),
         }
     }
 
-    async fn set(&self, namespace: &str, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
+    async fn set(&self, namespace: &str, key: &str, entry: StoredEntry) -> Result<(), CacheError> {
         let cache_key = build_cache_key(namespace, key);
 
         // Insert into Moka cache
@@ -145,21 +145,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_set_remove() {
-        let store: MokaStore<String> = MokaStore::new(MokaStoreConfig::default());
+        let store = MokaStore::new(MokaStoreConfig::default());
 
         // Initially empty
         let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_none());
 
-        // Set a value
+        // Set a value using Typed variant
         let now = now_ms();
-        let entry = Entry::new("value1".to_string(), now + 60_000, now + 300_000);
+        let entry = StoredEntry::from_typed("value1".to_string(), now + 60_000, now + 300_000);
         store.set("users", "key1", entry).await.unwrap();
 
         // Get the value
         let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_some());
-        assert_eq!(result.unwrap().value, "value1");
+        let stored = result.unwrap();
+
+        // Convert back to typed entry
+        let typed_entry: crate::entry::Entry<String> = stored.into_typed().unwrap();
+        assert_eq!(typed_entry.value, "value1");
 
         // Remove the value
         store.remove("users", &["key1"]).await.unwrap();
@@ -171,11 +175,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_expired_entry_removed() {
-        let store: MokaStore<String> = MokaStore::new(MokaStoreConfig::default());
+        let store = MokaStore::new(MokaStoreConfig::default());
 
         // Set a value that's already expired
         let now = now_ms();
-        let entry = Entry::new("value1".to_string(), now - 1000, now - 500);
+        let entry = StoredEntry::from_typed("value1".to_string(), now - 1000, now - 500);
         store.set("users", "expired_key", entry).await.unwrap();
 
         // Should return None and remove the entry

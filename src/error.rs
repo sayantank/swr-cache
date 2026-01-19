@@ -8,6 +8,9 @@ pub enum CacheError {
         key: String,
         message: String,
     },
+    /// Serialization or deserialization failed.
+    #[error("Serialization error: {0}")]
+    Serialization(String),
 }
 
 impl CacheError {

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
-use crate::entry::Entry;
+use crate::entry::{StorageMode, StoredEntry};
 use crate::error::CacheError;
 use crate::store::Store;
 
@@ -29,13 +29,6 @@ pub struct HashMapStoreConfig {
     pub evict_on_set: Option<EvictOnSetConfig>,
 }
 
-/// Internal stored entry with expiration time.
-#[derive(Clone)]
-struct StoredEntry<V> {
-    expires: i64,
-    entry: Entry<V>,
-}
-
 /// Thread-safe in-memory cache store using HashMap with RwLock.
 ///
 /// This is a simple, zero-dependency store suitable for:
@@ -43,19 +36,17 @@ struct StoredEntry<V> {
 /// - Small to medium cache sizes (<1000 items)
 /// - Applications prioritizing simplicity over performance
 ///
+/// HashMapStore is type-agnostic and can store values of any type.
+/// It prefers `StoredEntry::Typed` for zero-copy storage but can handle
+/// both typed and serialized entries.
+///
 /// For high-concurrency scenarios, consider using `MokaStore` instead.
-pub struct HashMapStore<V>
-where
-    V: Clone + Send + Sync,
-{
-    state: RwLock<HashMap<String, StoredEntry<V>>>,
+pub struct HashMapStore {
+    state: RwLock<HashMap<String, StoredEntry>>,
     evict_on_set: Option<EvictOnSetConfig>,
 }
 
-impl<V> HashMapStore<V>
-where
-    V: Clone + Send + Sync,
-{
+impl HashMapStore {
     /// Create a new HashMapStore with the given configuration.
     pub fn new(config: HashMapStoreConfig) -> Self {
         HashMapStore {
@@ -89,12 +80,15 @@ where
         let now = now_ms();
 
         // First delete all expired entries
-        state.retain(|_, v| v.expires > now);
+        state.retain(|_, v| v.stale_until() > now);
 
         // If still over max_items, remove oldest entries
         if state.len() > config.max_items {
             // Collect keys to remove (oldest first based on expiry)
-            let mut entries: Vec<_> = state.iter().map(|(k, v)| (k.clone(), v.expires)).collect();
+            let mut entries: Vec<_> = state
+                .iter()
+                .map(|(k, v)| (k.clone(), v.stale_until()))
+                .collect();
             entries.sort_by_key(|(_, expires)| *expires);
 
             let to_remove = state.len() - config.max_items;
@@ -106,15 +100,16 @@ where
 }
 
 #[async_trait]
-impl<V> Store<V> for HashMapStore<V>
-where
-    V: Clone + Send + Sync,
-{
+impl Store for HashMapStore {
     fn name(&self) -> &'static str {
         "hashmap"
     }
 
-    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Entry<V>>, CacheError> {
+    fn storage_mode(&self) -> StorageMode {
+        StorageMode::Typed
+    }
+
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<StoredEntry>, CacheError> {
         let cache_key = build_cache_key(namespace, key);
         let state = self.state.read().await;
 
@@ -123,7 +118,7 @@ where
         };
 
         let now = now_ms();
-        if stored.expires <= now {
+        if stored.is_expired(now) {
             // Entry is expired, remove it
             drop(state);
             let mut state = self.state.write().await;
@@ -131,21 +126,17 @@ where
             return Ok(None);
         }
 
-        Ok(Some(stored.entry.clone()))
+        // Clone the StoredEntry - this is cheap for Typed (Arc clone)
+        // and necessary for Serialized (String clone)
+        Ok(Some(stored.clone()))
     }
 
-    async fn set(&self, namespace: &str, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
+    async fn set(&self, namespace: &str, key: &str, entry: StoredEntry) -> Result<(), CacheError> {
         let cache_key = build_cache_key(namespace, key);
 
         {
             let mut state = self.state.write().await;
-            state.insert(
-                cache_key,
-                StoredEntry {
-                    expires: entry.stale_until,
-                    entry,
-                },
-            );
+            state.insert(cache_key, entry);
         }
 
         self.maybe_evict().await;
@@ -170,21 +161,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_set_remove() {
-        let store: HashMapStore<String> = HashMapStore::new(HashMapStoreConfig::default());
+        let store = HashMapStore::new(HashMapStoreConfig::default());
 
         // Initially empty
         let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_none());
 
-        // Set a value
+        // Set a value using Typed variant
         let now = now_ms();
-        let entry = Entry::new("value1".to_string(), now + 60_000, now + 300_000);
+        let entry = StoredEntry::from_typed("value1".to_string(), now + 60_000, now + 300_000);
         store.set("users", "key1", entry).await.unwrap();
 
         // Get the value
         let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_some());
-        assert_eq!(result.unwrap().value, "value1");
+        let stored = result.unwrap();
+
+        // Convert back to typed entry
+        let typed_entry: crate::entry::Entry<String> = stored.into_typed().unwrap();
+        assert_eq!(typed_entry.value, "value1");
+
+        // Set another value to test
+        let entry2 = StoredEntry::from_typed("value2".to_string(), now + 60_000, now + 300_000);
+        store.set("users", "key2", entry2).await.unwrap();
 
         // Remove the value
         store.remove("users", &["key1"]).await.unwrap();
@@ -192,5 +191,9 @@ mod tests {
         // Should be gone
         let result = store.get("users", "key1").await.unwrap();
         assert!(result.is_none());
+
+        // key2 should still exist
+        let result = store.get("users", "key2").await.unwrap();
+        assert!(result.is_some());
     }
 }

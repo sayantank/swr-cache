@@ -1,40 +1,60 @@
-//! Example demonstrating multi-namespace cache with CacheBuilder API.
+//! Example demonstrating type-agnostic stores with multiple Cache instances.
 //!
-//! This shows how to create a cache with multiple namespaces, each with
-//! their own configuration and stores. Note that all namespaces in a single
-//! cache must store the same value type.
+//! This shows how to create reusable stores that can be shared across
+//! multiple Cache instances with different value types. Each Cache maintains
+//! type safety while stores remain type-agnostic.
 
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use swr_cache::{CacheBuilder, HashMapStore, HashMapStoreConfig, Namespace};
+use swr_cache::{Cache, MokaStore, MokaStoreConfig, RedisStore, RedisStoreConfig};
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct User {
     id: String,
     name: String,
     email: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ApiKey {
+    key: String,
+    user_id: String,
+    created_at: i64,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create shared memory store
-    let memory = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+    // Create type-agnostic stores that can be reused across different types
+    let l1_store = Arc::new(MokaStore::new(MokaStoreConfig::default()));
+    let l2_store = Arc::new(
+        RedisStore::new(RedisStoreConfig {
+            url: "redis://localhost:6379".to_string(),
+            disable_expiration: false,
+        })
+        .await?,
+    );
 
-    // Create separate namespaces - they're isolated even though they share the store
-    let users_ns = Namespace::new("users", vec![memory.clone()], 60_000, 300_000);
-    let admins_ns = Namespace::new("admins", vec![memory], 120_000, 600_000); // Different TTL
+    // You could add more stores here (e.g., Redis for L2)
+    // let l2_store = Arc::new(RedisStore::new(RedisStoreConfig { ... }).await?);
 
-    // Build cache with multiple namespaces
-    let cache = CacheBuilder::new()
-        .add("users", users_ns)
-        .add("admins", admins_ns)
-        .build();
+    // Create separate Cache instances for different types
+    // These caches can share the same store instances!
+    let user_cache: Cache<User> = Cache::new(
+        "users",
+        vec![l1_store.clone(), l2_store],
+        60_000,  // fresh for 60 seconds
+        300_000, // stale for 5 minutes
+    );
 
-    // Access users namespace
-    let users = cache.namespace("users");
+    let apikey_cache: Cache<ApiKey> = Cache::new(
+        "apikeys",
+        vec![l1_store.clone()], // Same store instance!
+        120_000,                // fresh for 2 minutes
+        600_000,                // stale for 10 minutes
+    );
 
-    // Use SWR pattern - callback receives the actual key
-    let user = users
+    // Use the user cache with SWR pattern
+    let user = user_cache
         .swr("chronark", |id| async move {
             println!("Loading user from database: {}", id);
             Some(User {
@@ -51,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // Second call hits cache
-    let user2 = users
+    let user2 = user_cache
         .swr("chronark", |id| async move {
             println!("This won't be called - using cached value");
             Some(User {
@@ -64,27 +84,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("User (cached): {:?}", user2);
 
-    // Access admins namespace (isolated from users)
-    let admins = cache.namespace("admins");
-
-    admins
+    // Use the apikey cache (different type, same store!)
+    apikey_cache
         .set(
-            "admin:1",
-            User {
-                id: "admin:1".to_string(),
-                name: "Super Admin".to_string(),
-                email: "admin@example.com".to_string(),
+            "key_123",
+            ApiKey {
+                key: "sk_test_123".to_string(),
+                user_id: "chronark".to_string(),
+                created_at: 1234567890,
             },
         )
         .await?;
 
-    // Admin is not in users namespace
-    let not_found = users.get("admin:1").await?;
-    println!("Admin in users namespace: {:?}", not_found); // None
+    // ApiKey is in apikey cache
+    let api_key = apikey_cache.get("key_123").await?;
+    println!("ApiKey in apikey cache: {:?}", api_key);
 
-    // But exists in admins namespace
-    let admin = admins.get("admin:1").await?;
-    println!("Admin in admins namespace: {:?}", admin);
+    // But not in user cache (different namespace and type)
+    let not_found = user_cache.get("key_123").await?;
+    println!("key_123 in user cache: {:?}", not_found); // None
+
+    println!("\n✅ Both caches are using the same underlying store instance!");
+    println!("   This saves memory and connection resources while maintaining type safety.");
 
     Ok(())
 }

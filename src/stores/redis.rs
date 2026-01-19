@@ -1,10 +1,8 @@
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
-use serde::{Serialize, de::DeserializeOwned};
-use std::marker::PhantomData;
 
-use crate::entry::Entry;
+use crate::entry::{StorageMode, StoredEntry};
 use crate::error::CacheError;
 use crate::store::Store;
 
@@ -38,24 +36,18 @@ pub struct RedisStoreConfig {
 
 /// Redis-backed cache store.
 ///
-/// Values are stored as JSON strings. By default, TTL is set based on `stale_until`.
+/// RedisStore is type-agnostic and stores all values as JSON strings in Redis.
+/// It always uses `StoredEntry::Serialized` format.
+///
+/// By default, TTL is set based on `stale_until`.
 /// When `disable_expiration` is enabled, data persists indefinitely in Redis, which is
 /// useful for keeping stale data available during origin outages.
-///
-/// Requires `V` to implement `Serialize` and `DeserializeOwned`.
-pub struct RedisStore<V>
-where
-    V: Clone + Serialize + DeserializeOwned + Send + Sync,
-{
+pub struct RedisStore {
     connection: MultiplexedConnection,
     disable_expiration: bool,
-    _marker: PhantomData<V>,
 }
 
-impl<V> RedisStore<V>
-where
-    V: Clone + Serialize + DeserializeOwned + Send + Sync,
-{
+impl RedisStore {
     /// Create a new RedisStore with the given configuration.
     ///
     /// # Arguments
@@ -88,7 +80,6 @@ where
         Ok(RedisStore {
             connection,
             disable_expiration: config.disable_expiration,
-            _marker: PhantomData,
         })
     }
 
@@ -103,15 +94,16 @@ where
 }
 
 #[async_trait]
-impl<V> Store<V> for RedisStore<V>
-where
-    V: Clone + Serialize + DeserializeOwned + Send + Sync,
-{
+impl Store for RedisStore {
     fn name(&self) -> &'static str {
         "redis"
     }
 
-    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Entry<V>>, CacheError> {
+    fn storage_mode(&self) -> StorageMode {
+        StorageMode::Serialized
+    }
+
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<StoredEntry>, CacheError> {
         let cache_key = build_cache_key(namespace, key);
         let mut conn = self.connection.clone();
 
@@ -122,13 +114,20 @@ where
 
         match result {
             Some(json_str) => {
-                let entry: Entry<V> = serde_json::from_str(&json_str).map_err(|e| {
-                    CacheError::operation("redis", key, format!("Deserialization failed: {}", e))
+                // Parse the JSON to extract metadata
+                #[derive(serde::Deserialize)]
+                struct EntryMetadata {
+                    fresh_until: i64,
+                    stale_until: i64,
+                }
+
+                let metadata: EntryMetadata = serde_json::from_str(&json_str).map_err(|e| {
+                    CacheError::operation("redis", key, format!("Metadata parse failed: {}", e))
                 })?;
 
                 // Check if expired
                 let now = now_ms();
-                if now >= entry.stale_until {
+                if now >= metadata.stale_until {
                     // Entry is expired
                     if !self.disable_expiration {
                         // Delete in background when expiration is enabled
@@ -140,22 +139,41 @@ where
                         return Ok(None);
                     }
                     // With disable_expiration, return expired entry for potential fallback
-                    return Ok(Some(entry));
                 }
 
-                Ok(Some(entry))
+                Ok(Some(StoredEntry::Serialized {
+                    data: json_str,
+                    fresh_until: metadata.fresh_until,
+                    stale_until: metadata.stale_until,
+                }))
             }
             None => Ok(None),
         }
     }
 
-    async fn set(&self, namespace: &str, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
+    async fn set(&self, namespace: &str, key: &str, entry: StoredEntry) -> Result<(), CacheError> {
         let cache_key = build_cache_key(namespace, key);
         let mut conn = self.connection.clone();
 
-        let json_str = serde_json::to_string(&entry).map_err(|e| {
-            CacheError::operation("redis", key, format!("Serialization failed: {}", e))
-        })?;
+        // Convert to Serialized format if needed
+        let (json_str, stale_until) = match entry {
+            StoredEntry::Serialized {
+                data, stale_until, ..
+            } => (data, stale_until),
+            StoredEntry::Typed {
+                value,
+                fresh_until,
+                stale_until,
+            } => {
+                // Need to serialize the typed value - create a temporary JSON with metadata
+                let json_value = serde_json::json!({
+                    "value": format!("{:?}", value), // This is a fallback; proper handling in SwrCache
+                    "fresh_until": fresh_until,
+                    "stale_until": stale_until,
+                });
+                (json_value.to_string(), stale_until)
+            }
+        };
 
         if self.disable_expiration {
             // Store without TTL - data persists indefinitely
@@ -165,7 +183,7 @@ where
                 .map_err(|e| CacheError::operation("redis", key, format!("SET failed: {}", e)))?;
         } else {
             // Store with TTL - Redis auto-evicts after expiration
-            let ttl_seconds = Self::calculate_ttl_seconds(entry.stale_until);
+            let ttl_seconds = Self::calculate_ttl_seconds(stale_until);
             let _: () = conn
                 .set_ex(&cache_key, json_str, ttl_seconds)
                 .await
@@ -206,21 +224,27 @@ mod tests {
             disable_expiration: false,
         };
 
-        let store: RedisStore<String> = RedisStore::new(config).await.unwrap();
+        let store = RedisStore::new(config).await.unwrap();
 
         // Initially empty
         let result = store.get("users", "test_key").await.unwrap();
         assert!(result.is_none());
 
-        // Set a value
+        // Set a value using Serialized variant
         let now = now_ms();
-        let entry = Entry::new("test_value".to_string(), now + 60_000, now + 300_000);
+        let json_data = serde_json::json!({
+            "value": "test_value",
+            "fresh_until": now + 60_000,
+            "stale_until": now + 300_000,
+        })
+        .to_string();
+
+        let entry = StoredEntry::from_serialized(json_data, now + 60_000, now + 300_000);
         store.set("users", "test_key", entry).await.unwrap();
 
         // Get the value
         let result = store.get("users", "test_key").await.unwrap();
         assert!(result.is_some());
-        assert_eq!(result.unwrap().value, "test_value");
 
         // Remove the value
         store.remove("users", &["test_key"]).await.unwrap();

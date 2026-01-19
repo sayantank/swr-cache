@@ -1,9 +1,10 @@
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{RwLock, oneshot};
 
-use crate::entry::Entry;
+use crate::entry::{Entry, StorageMode, StoredEntry};
 use crate::error::CacheError;
 use crate::store::Store;
 use crate::utils::{build_cache_key, now_ms};
@@ -28,11 +29,15 @@ pub struct SetOptions {
 }
 
 /// Internal cache implementation with stale-while-revalidate support.
+///
+/// SwrCache handles type conversion between typed values (`V`) and type-erased
+/// storage (`StoredEntry`). It requires `V` to implement `Serialize + DeserializeOwned`
+/// to support conversion between typed and serialized formats.
 pub struct SwrCache<V>
 where
     V: Clone + Send + Sync,
 {
-    store: Arc<dyn Store<V>>,
+    store: Arc<dyn Store>,
     fresh_ms: i64,
     stale_ms: i64,
     /// To prevent concurrent revalidation of the same data, all revalidations are deduplicated.
@@ -55,7 +60,7 @@ where
 
 impl<V> SwrCache<V>
 where
-    V: Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
 {
     /// Create a new SWR cache.
     ///
@@ -63,7 +68,7 @@ where
     /// * `store` - The underlying store implementation
     /// * `fresh_ms` - Default time in milliseconds before an entry becomes stale
     /// * `stale_ms` - Default time in milliseconds before an entry expires completely
-    pub fn new(store: Arc<dyn Store<V>>, fresh_ms: i64, stale_ms: i64) -> Self {
+    pub fn new(store: Arc<dyn Store>, fresh_ms: i64, stale_ms: i64) -> Self {
         SwrCache {
             store,
             fresh_ms,
@@ -84,13 +89,16 @@ where
     async fn get_internal(&self, namespace: &str, key: &str) -> Result<GetResult<V>, CacheError> {
         let res = self.store.get(namespace, key).await?;
 
-        let Some(entry) = res else {
+        let Some(stored_entry) = res else {
             return Ok(GetResult {
                 value: None,
                 revalidate: false,
                 is_expired: false,
             });
         };
+
+        // Convert StoredEntry to Entry<V>
+        let entry: Entry<V> = stored_entry.into_typed()?;
 
         let now = now_ms();
 
@@ -134,8 +142,20 @@ where
         let fresh_ms = opts.as_ref().map(|o| o.fresh_ms).unwrap_or(self.fresh_ms);
         let stale_ms = opts.as_ref().map(|o| o.stale_ms).unwrap_or(self.stale_ms);
 
-        let entry = Entry::new(value, now + fresh_ms, now + stale_ms);
-        self.store.set(namespace, key, entry).await
+        // Convert to StoredEntry based on store's preference
+        let stored_entry = match self.store.storage_mode() {
+            StorageMode::Typed => StoredEntry::from_typed(value, now + fresh_ms, now + stale_ms),
+            StorageMode::Serialized => {
+                let json_data =
+                    serde_json::to_string(&Entry::new(value, now + fresh_ms, now + stale_ms))
+                        .map_err(|e| {
+                            CacheError::Serialization(format!("Serialization failed: {}", e))
+                        })?;
+                StoredEntry::from_serialized(json_data, now + fresh_ms, now + stale_ms)
+            }
+        };
+
+        self.store.set(namespace, key, stored_entry).await
     }
 
     /// Removes the key from the cache.
@@ -146,13 +166,26 @@ where
     /// Cache a value in the background.
     fn cache_value(&self, namespace: &str, key: &str, value: V) {
         let store = self.store.clone();
+        let storage_mode = store.storage_mode();
         let namespace = namespace.to_string();
         let key = key.to_string();
         let now = now_ms();
-        let entry = Entry::new(value, now + self.fresh_ms, now + self.stale_ms);
+        let fresh_until = now + self.fresh_ms;
+        let stale_until = now + self.stale_ms;
 
         tokio::spawn(async move {
-            let _ = store.set(&namespace, &key, entry).await;
+            let stored_entry = match storage_mode {
+                StorageMode::Typed => StoredEntry::from_typed(value, fresh_until, stale_until),
+                StorageMode::Serialized => {
+                    match serde_json::to_string(&Entry::new(value, fresh_until, stale_until)) {
+                        Ok(json_data) => {
+                            StoredEntry::from_serialized(json_data, fresh_until, stale_until)
+                        }
+                        Err(_) => return, // Skip caching on serialization error
+                    }
+                }
+            };
+            let _ = store.set(&namespace, &key, stored_entry).await;
         });
     }
 
@@ -264,6 +297,7 @@ where
         Fut: Future<Output = Option<V>> + Send,
     {
         let store = self.store.clone();
+        let storage_mode = store.storage_mode();
         let revalidating = self.revalidating.clone();
         let namespace = namespace.to_string();
         let key = key.to_string();
@@ -293,10 +327,28 @@ where
             let value = load_from_origin(key.clone()).await;
 
             // Update cache
-            if let Some(ref v) = value {
+            if let Some(v) = value {
                 let now = crate::utils::now_ms();
-                let entry = Entry::new(v.clone(), now + fresh_ms, now + stale_ms);
-                let _ = store.set(&namespace, &key, entry).await;
+                let fresh_until = now + fresh_ms;
+                let stale_until = now + stale_ms;
+
+                let stored_entry = match storage_mode {
+                    StorageMode::Typed => StoredEntry::from_typed(v, fresh_until, stale_until),
+                    StorageMode::Serialized => {
+                        match serde_json::to_string(&Entry::new(v, fresh_until, stale_until)) {
+                            Ok(json_data) => {
+                                StoredEntry::from_serialized(json_data, fresh_until, stale_until)
+                            }
+                            Err(_) => {
+                                // Remove from revalidating and return
+                                let mut map = revalidating.write().await;
+                                map.remove(&revalidate_key);
+                                return;
+                            }
+                        }
+                    }
+                };
+                let _ = store.set(&namespace, &key, stored_entry).await;
             }
 
             // Remove from revalidating
@@ -330,7 +382,9 @@ where
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Try cache again
-                if let Ok(Some(entry)) = self.store.get(namespace, key).await {
+                if let Ok(Some(stored_entry)) = self.store.get(namespace, key).await
+                    && let Ok(entry) = stored_entry.into_typed::<V>()
+                {
                     return Ok(Some(entry.value));
                 }
             }
@@ -366,8 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_swr_cache_miss_loads_from_origin() {
-        let store: Arc<dyn Store<String>> =
-            Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+        let store: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
         let cache = SwrCache::new(store, 60_000, 300_000);
 
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -412,8 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_and_set() {
-        let store: Arc<dyn Store<String>> =
-            Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+        let store: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
         let cache = SwrCache::new(store, 60_000, 300_000);
 
         // Initially empty
