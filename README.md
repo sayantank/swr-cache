@@ -6,11 +6,12 @@ A **stale-while-revalidate (SWR) cache library** for Rust with support for multi
 
 - 🚀 **Stale-While-Revalidate (SWR)** semantics for optimal performance and user experience
 - 🔄 **Multi-tier caching** - chain multiple stores (e.g., memory L1 + Redis L2)
-- 🎯 **Type-safe** - generic over both namespace and value types
-- 🔌 **Pluggable stores** - in-memory (HashMap) and Redis implementations out of the box
+- 🎯 **Type-safe** - each cache is strongly typed while stores remain type-agnostic
+- ♻️ **Reusable stores** - share store instances across caches with different types
+- 🔌 **Pluggable stores** - in-memory (HashMap, Moka) and Redis implementations out of the box
 - ⚡ **Background revalidation** - automatic cache refreshing using `tokio::spawn`
 - 🎪 **Deduplication** - prevents thundering herd with concurrent origin requests
-- 📦 **Zero-copy entry times** - uses Unix milliseconds for TTL management
+- 🚫 **Zero serialization overhead** - in-memory stores use typed values directly
 - 🧪 **Well-tested** - integration tests for all store backends
 
 ## Installation
@@ -26,29 +27,31 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 ## Quick Start
 
 ```rust
-use swr_cache::{CacheBuilder, Namespace, HashMapStore, HashMapStoreConfig};
+use swr_cache::{Cache, MokaStore, MokaStoreConfig};
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct User {
+    id: String,
+    name: String,
+}
 
 #[tokio::main]
 async fn main() {
-    // Create an in-memory cache
-    let memory = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
-
-    // Create namespaces with different configurations
-    let users = Namespace::new("users", vec![memory.clone()], 60_000, 300_000);
-    let products = Namespace::new("products", vec![memory], 60_000, 300_000);
-
-    // Build cache with multiple namespaces
-    let cache = CacheBuilder::new()
-        .add("users", users)
-        .add("products", products)
-        .build();
-
-    // Access specific namespace
-    let users_cache = cache.namespace("users");
+    // Create type-agnostic stores (can be reused across different types!)
+    let l1_store = Arc::new(MokaStore::new(MokaStoreConfig::default()));
+    
+    // Create a cache for User type
+    let user_cache: Cache<User> = Cache::new(
+        "users",
+        vec![l1_store.clone()],
+        60_000,  // fresh for 60 seconds
+        300_000, // stale for 5 minutes
+    );
 
     // Use SWR pattern - callback receives the actual key
-    let user = users_cache.swr("user:123", |id| async move {
+    let user = user_cache.swr("user:123", |id| async move {
         // Load from database or API - 'id' is "user:123"
         fetch_user_from_db(&id).await
     }).await.unwrap();
@@ -56,9 +59,12 @@ async fn main() {
     println!("User: {:?}", user);
 }
 
-async fn fetch_user_from_db(id: &str) -> Option<String> {
+async fn fetch_user_from_db(id: &str) -> Option<User> {
     // Simulate database lookup
-    Some(format!("User data for {}", id))
+    Some(User {
+        id: id.to_string(),
+        name: "Alice".to_string(),
+    })
 }
 ```
 
@@ -68,21 +74,28 @@ async fn fetch_user_from_db(id: &str) -> Option<String> {
 
 #### 1. **Store Trait** (`src/store.rs`)
 
-Generic interface for cache implementations:
+Type-agnostic interface for cache implementations. Stores work with `StoredEntry` which can hold either typed values (for in-memory stores) or serialized JSON (for persistent stores):
 
 ```rust
 #[async_trait]
-pub trait Store<N, V>: Send + Sync
-where
-    N: Clone + Eq + Hash + Display + Send + Sync,
-    V: Clone + Send + Sync,
-{
+pub trait Store: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn get(&self, namespace: N, key: &str) -> Result<Option<Entry<V>>, CacheError>;
-    async fn set(&self, namespace: N, key: &str, entry: Entry<V>) -> Result<(), CacheError>;
-    async fn remove(&self, namespace: N, keys: &[&str]) -> Result<(), CacheError>;
+    
+    // Returns storage preference (Typed or Serialized)
+    fn storage_mode(&self) -> StorageMode;
+    
+    async fn get(&self, namespace: &str, key: &str) 
+        -> Result<Option<StoredEntry>, CacheError>;
+    
+    async fn set(&self, namespace: &str, key: &str, entry: StoredEntry) 
+        -> Result<(), CacheError>;
+    
+    async fn remove(&self, namespace: &str, keys: &[&str]) 
+        -> Result<(), CacheError>;
 }
 ```
+
+This design allows the same store instance to serve multiple caches with different types.
 
 #### 2. **Entry** (`src/entry.rs`)
 
@@ -205,7 +218,7 @@ This ensures data is always available, even during extended outages.
 Multi-level cache hierarchy:
 
 ```rust
-let l1 = Arc::new(MemoryStore::new(MemoryStoreConfig::default()));
+let l1 = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
 let l2 = Arc::new(RedisStore::new(redis_config).await?);
 
 let tiered = TieredStore::from_stores(vec![l1, l2]);
@@ -223,7 +236,6 @@ Stale-while-revalidate implementation:
 ```rust
 pub async fn swr<F, Fut>(
     &self,
-    namespace: N,
     key: &str,
     load_from_origin: F,
 ) -> Result<Option<V>, CacheError>
@@ -238,20 +250,20 @@ where
 - Background cache updates with `tokio::spawn`
 - No blocking on cache misses
 
-#### 7. **Namespace** (`src/namespace.rs`)
+#### 7. **Cache** (`src/cache.rs`)
 
 High-level API combining `TieredStore` + `SwrCache`:
 
 ```rust
-let cache = Namespace::new(stores, fresh_ms, stale_ms);
+let cache: Cache<User> = Cache::new("users", stores, fresh_ms, stale_ms);
 
 // Simple CRUD
-cache.set(ns, "key", value).await?;
-let value = cache.get(ns, "key").await?;
-cache.remove(ns, "key").await?;
+cache.set("key", value).await?;
+let value = cache.get("key").await?;
+cache.remove(&["key"]).await?;
 
 // SWR pattern
-let value = cache.swr(ns, "key", |key| async {
+let value = cache.swr("key", |key| async {
     fetch_from_origin(&key).await
 }).await?;
 ```
@@ -269,13 +281,14 @@ let value = cache.swr(ns, "key", |key| async {
 ### Pattern 1: Simple In-Memory Cache with HashMapStore
 
 ```rust
-let cache = Namespace::new(
+let cache: Cache<User> = Cache::new(
+    "users",
     vec![Arc::new(HashMapStore::new(HashMapStoreConfig::default()))],
     60_000,   // 1 minute fresh
     300_000,  // 5 minutes stale
 );
 
-let user = cache.swr(Namespace::Users, "user:123", |key| async {
+let user = cache.swr("user:123", |key| async {
     db.get_user(&key).await
 }).await?;
 ```
@@ -289,7 +302,7 @@ let moka = Arc::new(MokaStore::new(MokaStoreConfig {
     time_to_idle: None,
 }));
 
-let cache = Namespace::new(vec![moka], 60_000, 300_000);
+let cache: Cache<User> = Cache::new("users", vec![moka], 60_000, 300_000);
 ```
 
 ### Pattern 3: L1 Memory + L2 Redis (CDN Pattern)
@@ -306,7 +319,7 @@ let redis = Arc::new(RedisStore::new(RedisStoreConfig {
     disable_expiration: false,  // Use Redis TTL
 }).await?);
 
-let cache = Namespace::new(vec![moka, redis], 60_000, 300_000);
+let cache: Cache<User> = Cache::new("users", vec![moka, redis], 60_000, 300_000);
 
 // First request: miss L1, miss L2, load from origin, populate both
 // Second request: hit L1, immediate response
@@ -329,7 +342,7 @@ let redis = Arc::new(RedisStore::new(RedisStoreConfig {
     disable_expiration: true,  // Keep stale data forever
 }).await?);
 
-let cache = Namespace::new(vec![memory, redis], 60_000, 300_000);
+let cache: Cache<User> = Cache::new("users", vec![memory, redis], 60_000, 300_000);
 
 // During normal operation:
 // - Fresh data served from memory (L1)
@@ -347,17 +360,17 @@ let cache = Namespace::new(vec![memory, redis], 60_000, 300_000);
 // - Service returns to normal
 ```
 
-### Pattern 5: Namespace-Specific Configurations
+### Pattern 5: Type-Specific Configurations
 
 ```rust
 // Users: short cache lifetime
-let user_cache = Namespace::new(stores.clone(), 30_000, 120_000);
+let user_cache: Cache<User> = Cache::new("users", stores.clone(), 30_000, 120_000);
 
 // Products: longer cache lifetime
-let product_cache = Namespace::new(stores.clone(), 300_000, 3_600_000);
+let product_cache: Cache<Product> = Cache::new("products", stores.clone(), 300_000, 3_600_000);
 
 // API responses: medium lifetime
-let api_cache = Namespace::new(stores.clone(), 60_000, 600_000);
+let api_cache: Cache<ApiResponse> = Cache::new("api", stores.clone(), 60_000, 600_000);
 ```
 
 ## Cache State Diagram
@@ -460,9 +473,9 @@ GitHub Actions workflow (`.github/workflows/ci.yml`):
 
 ```rust
 // Cache API responses from upstream services
-let cache = Namespace::new(stores, 60_000, 600_000);
+let cache: Cache<ApiResponse> = Cache::new("api", stores, 60_000, 600_000);
 
-let response = cache.swr(Namespace::Api, endpoint_path, |path| async {
+let response = cache.swr(endpoint_path, |path| async {
     fetch_from_upstream(&path).await
 }).await?;
 ```
@@ -476,9 +489,9 @@ let response = cache.swr(Namespace::Api, endpoint_path, |path| async {
 
 ```rust
 // Cache frequently queried data
-let cache = Namespace::new(stores, 120_000, 600_000);
+let cache: Cache<User> = Cache::new("users", stores, 120_000, 600_000);
 
-let user = cache.swr(Namespace::Users, user_id, |id| async {
+let user = cache.swr(user_id, |id| async {
     db.query("SELECT * FROM users WHERE id = ?", id).await
 }).await?;
 ```
@@ -492,13 +505,14 @@ let user = cache.swr(Namespace::Users, user_id, |id| async {
 
 ```rust
 // Multi-tier session cache
-let session_cache = Namespace::new(
+let session_cache: Cache<Session> = Cache::new(
+    "sessions",
     vec![memory_store, redis_store],  // Fast local + persistent
     300_000,  // 5 min fresh
     3_600_000 // 1 hour stale (enough for session recovery)
 );
 
-let session = cache.swr(Namespace::Sessions, session_id, |id| async {
+let session = session_cache.swr(session_id, |id| async {
     load_session_from_store(&id).await
 }).await?;
 ```
@@ -512,9 +526,9 @@ let session = cache.swr(Namespace::Sessions, session_id, |id| async {
 
 ```rust
 // Cache rate limit decisions to avoid database calls
-let cache = Namespace::new(stores, 1_000, 60_000);  // Very short TTL
+let cache: Cache<RateLimitStatus> = Cache::new("rate_limits", stores, 1_000, 60_000);  // Very short TTL
 
-let allowed = cache.swr(Namespace::RateLimit, client_id, |id| async {
+let allowed = cache.swr(client_id, |id| async {
     check_rate_limit(&id).await
 }).await?;
 ```
@@ -535,10 +549,10 @@ let redis = Arc::new(RedisStore::new(RedisStoreConfig {
     disable_expiration: true,  // Keep stale data forever
 }).await?);
 
-let cache = Namespace::new(vec![redis], 60_000, 300_000);
+let cache: Cache<AppConfig> = Cache::new("config", vec![redis], 60_000, 300_000);
 
 // Cache critical configuration or pricing data
-let config = cache.swr(Namespace::Config, "app_config", |_| async {
+let config = cache.swr("app_config", |_| async {
     fetch_config_from_api().await  // May fail sometimes
 }).await?;
 ```
@@ -605,7 +619,7 @@ let redis = Arc::new(RedisStore::new(RedisStoreConfig {
     disable_expiration: false,
 }).await?);
 
-let cache = Namespace::new(vec![moka, redis], 30_000, 180_000);
+let cache: Cache<ApiResponse> = Cache::new("api", vec![moka, redis], 30_000, 180_000);
 ```
 
 ### Medium-Traffic App (thousands of req/s)
@@ -624,7 +638,7 @@ let redis = Arc::new(RedisStore::new(RedisStoreConfig {
     disable_expiration: false,
 }).await?);
 
-let cache = Namespace::new(vec![moka, redis], 60_000, 600_000);
+let cache: Cache<User> = Cache::new("users", vec![moka, redis], 60_000, 600_000);
 ```
 
 ### Single-Service App (hundreds of req/s)
@@ -639,7 +653,7 @@ let hashmap = Arc::new(HashMapStore::new(HashMapStoreConfig {
     }),
 }));
 
-let cache = Namespace::new(vec![hashmap], 120_000, 600_000);
+let cache: Cache<User> = Cache::new("users", vec![hashmap], 120_000, 600_000);
 ```
 
 ## Benchmarking

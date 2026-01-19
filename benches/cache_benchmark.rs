@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use std::sync::Arc;
 use std::time::Duration;
 use swr_cache::{
-    HashMapStore, HashMapStoreConfig, MokaStore, MokaStoreConfig, Namespace, RedisStore,
+    Cache, HashMapStore, HashMapStoreConfig, MokaStore, MokaStoreConfig, RedisStore,
     RedisStoreConfig, Store,
 };
 use tokio::runtime::Runtime;
@@ -11,23 +11,23 @@ mod common;
 use common::{BenchConfig, BenchUser, FakeDatabase, KeyGenerator};
 
 /// Setup HashMapStore + Redis tier
-async fn setup_hashmap_redis(redis_url: &str) -> Namespace<BenchUser> {
+async fn setup_hashmap_redis(redis_url: &str) -> Cache<BenchUser> {
     let hashmap = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
     let redis_config = RedisStoreConfig {
         url: redis_url.to_string(),
         disable_expiration: false,
     };
-    let redis: Arc<dyn Store<BenchUser>> = Arc::new(
+    let redis: Arc<dyn Store> = Arc::new(
         RedisStore::new(redis_config)
             .await
             .expect("Redis connection failed"),
     );
 
-    Namespace::new("users", vec![hashmap, redis], 60_000, 300_000)
+    Cache::new("users", vec![hashmap, redis], 60_000, 300_000)
 }
 
 /// Setup MokaStore + Redis tier
-async fn setup_moka_redis(redis_url: &str) -> Namespace<BenchUser> {
+async fn setup_moka_redis(redis_url: &str) -> Cache<BenchUser> {
     let moka = Arc::new(MokaStore::new(MokaStoreConfig {
         max_capacity: 10_000,
         time_to_live: None,
@@ -37,13 +37,13 @@ async fn setup_moka_redis(redis_url: &str) -> Namespace<BenchUser> {
         url: redis_url.to_string(),
         disable_expiration: false,
     };
-    let redis: Arc<dyn Store<BenchUser>> = Arc::new(
+    let redis: Arc<dyn Store> = Arc::new(
         RedisStore::new(redis_config)
             .await
             .expect("Redis connection failed"),
     );
 
-    Namespace::new("users", vec![moka, redis], 60_000, 300_000)
+    Cache::new("users", vec![moka, redis], 60_000, 300_000)
 }
 
 /// Benchmark 1: Hot Cache (all hits, pure cache read performance)

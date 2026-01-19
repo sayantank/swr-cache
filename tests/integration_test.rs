@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use swr_cache::{
-    Entry, HashMapStore, HashMapStoreConfig, MokaStore, MokaStoreConfig, Namespace, RedisStore,
-    RedisStoreConfig, Store, TieredStore,
+    Cache, Entry, HashMapStore, HashMapStoreConfig, MokaStore, MokaStoreConfig, RedisStore,
+    RedisStoreConfig, Store, StoredEntry, TieredStore,
 };
 
 // ============================================================================
@@ -64,7 +64,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-async fn create_redis_store() -> RedisStore<User> {
+async fn create_redis_store() -> RedisStore {
     let config = RedisStoreConfig {
         url: "redis://localhost:6379".to_string(),
         disable_expiration: false,
@@ -80,8 +80,8 @@ async fn create_redis_store() -> RedisStore<User> {
 
 #[tokio::test]
 async fn test_hashmap_store_swr_cache_miss_loads_from_origin() {
-    let store: Arc<dyn Store<User>> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+    let cache: Cache<User> = Cache::new("users", vec![store], 60_000, 300_000);
 
     let db = fake_user_db();
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -107,8 +107,8 @@ async fn test_hashmap_store_swr_cache_miss_loads_from_origin() {
 
 #[tokio::test]
 async fn test_hashmap_store_swr_cache_hit_does_not_call_origin() {
-    let store: Arc<dyn Store<User>> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     let db = fake_user_db();
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -154,8 +154,8 @@ async fn test_hashmap_store_swr_cache_hit_does_not_call_origin() {
 
 #[tokio::test]
 async fn test_hashmap_store_get_set_remove() {
-    let store: Arc<dyn Store<User>> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     let user = User {
         id: 99,
@@ -184,8 +184,8 @@ async fn test_hashmap_store_get_set_remove() {
 
 #[tokio::test]
 async fn test_moka_store_swr_cache_miss_loads_from_origin() {
-    let store: Arc<dyn Store<User>> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     let db = fake_user_db();
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -211,8 +211,8 @@ async fn test_moka_store_swr_cache_miss_loads_from_origin() {
 
 #[tokio::test]
 async fn test_moka_store_swr_cache_hit_does_not_call_origin() {
-    let store: Arc<dyn Store<User>> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     let db = fake_user_db();
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -258,8 +258,8 @@ async fn test_moka_store_swr_cache_hit_does_not_call_origin() {
 
 #[tokio::test]
 async fn test_moka_store_get_set_remove() {
-    let store: Arc<dyn Store<User>> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(MokaStore::new(MokaStoreConfig::default()));
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     let user = User {
         id: 99,
@@ -288,8 +288,8 @@ async fn test_moka_store_get_set_remove() {
 
 #[tokio::test]
 async fn test_redis_store_swr_cache_miss_loads_from_origin() {
-    let store: Arc<dyn Store<User>> = Arc::new(create_redis_store().await);
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(create_redis_store().await);
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     // Use unique key to avoid conflicts with other tests
     let test_key = format!("user:redis_test_{}", now_ms());
@@ -322,8 +322,8 @@ async fn test_redis_store_swr_cache_miss_loads_from_origin() {
 
 #[tokio::test]
 async fn test_redis_store_swr_cache_hit_does_not_call_origin() {
-    let store: Arc<dyn Store<User>> = Arc::new(create_redis_store().await);
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(create_redis_store().await);
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     let test_key = format!("user:redis_hit_test_{}", now_ms());
 
@@ -374,8 +374,8 @@ async fn test_redis_store_swr_cache_hit_does_not_call_origin() {
 
 #[tokio::test]
 async fn test_redis_store_get_set_remove() {
-    let store: Arc<dyn Store<User>> = Arc::new(create_redis_store().await);
-    let cache = Namespace::new("users", vec![store], 60_000, 300_000);
+    let store: Arc<dyn Store> = Arc::new(create_redis_store().await);
+    let cache = Cache::new("users", vec![store], 60_000, 300_000);
 
     let test_key = format!("user:redis_crud_{}", now_ms());
 
@@ -406,9 +406,8 @@ async fn test_redis_store_get_set_remove() {
 
 #[tokio::test]
 async fn test_tiered_store_l2_hit_populates_l1() {
-    let hashmap_store: Arc<dyn Store<User>> =
-        Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
-    let redis_store: Arc<dyn Store<User>> = Arc::new(create_redis_store().await);
+    let hashmap_store: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+    let redis_store: Arc<dyn Store> = Arc::new(create_redis_store().await);
 
     let test_key = format!("user:tiered_test_{}", now_ms());
 
@@ -419,15 +418,22 @@ async fn test_tiered_store_l2_hit_populates_l1() {
         email: "tiered@example.com".into(),
     };
     let now = now_ms();
-    let entry = Entry::new(user.clone(), now + 60_000, now + 300_000);
-    redis_store.set("users", &test_key, entry).await.unwrap();
+    let stored_entry = StoredEntry::from_serialized(
+        serde_json::to_string(&Entry::new(user.clone(), now + 60_000, now + 300_000)).unwrap(),
+        now + 60_000,
+        now + 300_000,
+    );
+    redis_store
+        .set("users", &test_key, stored_entry)
+        .await
+        .unwrap();
 
     // Memory (L1) should be empty
     let l1_result = hashmap_store.get("users", &test_key).await.unwrap();
     assert!(l1_result.is_none());
 
     // Create tiered store: HashMap (L1) -> Redis (L2)
-    let tiered: Arc<dyn Store<User>> = Arc::new(TieredStore::from_stores(vec![
+    let tiered: Arc<dyn Store> = Arc::new(TieredStore::from_stores(vec![
         hashmap_store.clone(),
         redis_store.clone(),
     ]));
@@ -435,7 +441,8 @@ async fn test_tiered_store_l2_hit_populates_l1() {
     // Get from tiered - should find in L2 (Redis)
     let result = tiered.get("users", &test_key).await.unwrap();
     assert!(result.is_some());
-    assert_eq!(result.unwrap().value.name, "Tiered User");
+    let typed_result: Entry<User> = result.unwrap().into_typed().unwrap();
+    assert_eq!(typed_result.value.name, "Tiered User");
 
     // Wait for background L1 population
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -443,7 +450,8 @@ async fn test_tiered_store_l2_hit_populates_l1() {
     // Memory (L1) should now have the value
     let l1_result = hashmap_store.get("users", &test_key).await.unwrap();
     assert!(l1_result.is_some());
-    assert_eq!(l1_result.unwrap().value.name, "Tiered User");
+    let typed_l1: Entry<User> = l1_result.unwrap().into_typed().unwrap();
+    assert_eq!(typed_l1.value.name, "Tiered User");
 
     // Cleanup
     redis_store.remove("users", &[&test_key]).await.unwrap();
@@ -451,11 +459,10 @@ async fn test_tiered_store_l2_hit_populates_l1() {
 
 #[tokio::test]
 async fn test_tiered_store_with_namespace_swr() {
-    let hashmap_store: Arc<dyn Store<User>> =
-        Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
-    let redis_store: Arc<dyn Store<User>> = Arc::new(create_redis_store().await);
+    let hashmap_store: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+    let redis_store: Arc<dyn Store> = Arc::new(create_redis_store().await);
 
-    let cache = Namespace::new(
+    let cache = Cache::new(
         "users",
         vec![hashmap_store.clone(), redis_store.clone()],
         60_000,
@@ -524,7 +531,7 @@ async fn test_redis_store_disable_expiration_preserves_stale_data() {
         url: "redis://localhost:6379".to_string(),
         disable_expiration: true,
     };
-    let store: Arc<dyn Store<User>> = Arc::new(
+    let store: Arc<dyn Store> = Arc::new(
         RedisStore::new(config)
             .await
             .expect("Failed to connect to Redis"),
@@ -540,8 +547,12 @@ async fn test_redis_store_disable_expiration_preserves_stale_data() {
 
     // Set entry with very short TTL (1 second stale_until)
     let now = now_ms();
-    let entry = Entry::new(user.clone(), now - 1000, now + 1000); // fresh_until in past, stale_until 1s from now
-    store.set("users", &test_key, entry).await.unwrap();
+    let stored_entry = StoredEntry::from_serialized(
+        serde_json::to_string(&Entry::new(user.clone(), now - 1000, now + 1000)).unwrap(),
+        now - 1000,
+        now + 1000,
+    );
+    store.set("users", &test_key, stored_entry).await.unwrap();
 
     // Wait for stale_until to pass
     tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
@@ -553,17 +564,21 @@ async fn test_redis_store_disable_expiration_preserves_stale_data() {
         result.is_some(),
         "get() should return expired entry when disable_expiration is true"
     );
+    let typed_result: Entry<User> = result.unwrap().into_typed().unwrap();
     assert_eq!(
-        result.unwrap().value.name,
-        "Stale User",
+        typed_result.value.name, "Stale User",
         "Expired entry value should match"
     );
 
     // However, if we query Redis directly, the data should still be there
     // Let's verify by setting a new entry and checking it persists
     let now = now_ms();
-    let entry2 = Entry::new(user.clone(), now + 60_000, now + 300_000);
-    store.set("users", &test_key, entry2).await.unwrap();
+    let stored_entry2 = StoredEntry::from_serialized(
+        serde_json::to_string(&Entry::new(user.clone(), now + 60_000, now + 300_000)).unwrap(),
+        now + 60_000,
+        now + 300_000,
+    );
+    store.set("users", &test_key, stored_entry2).await.unwrap();
 
     let result = store.get("users", &test_key).await.unwrap();
     assert!(result.is_some(), "Fresh entry should be retrievable");
@@ -579,13 +594,13 @@ async fn test_redis_store_disable_expiration_with_swr_resilience() {
         url: "redis://localhost:6379".to_string(),
         disable_expiration: true,
     };
-    let store: Arc<dyn Store<User>> = Arc::new(
+    let store: Arc<dyn Store> = Arc::new(
         RedisStore::new(config)
             .await
             .expect("Failed to connect to Redis"),
     );
 
-    let cache = Namespace::new("users", vec![store.clone()], 100, 1000); // 100ms fresh, 1000ms stale
+    let cache = Cache::new("users", vec![store.clone()], 100, 1000); // 100ms fresh, 1000ms stale
 
     let test_key = format!("user:swr_resilient_{}", now_ms());
 
@@ -679,7 +694,7 @@ async fn test_redis_store_with_expiration_enabled_deletes_stale_data() {
         url: "redis://localhost:6379".to_string(),
         disable_expiration: false,
     };
-    let store: Arc<dyn Store<User>> = Arc::new(
+    let store: Arc<dyn Store> = Arc::new(
         RedisStore::new(config)
             .await
             .expect("Failed to connect to Redis"),
@@ -695,8 +710,12 @@ async fn test_redis_store_with_expiration_enabled_deletes_stale_data() {
 
     // Set entry with very short TTL (2 second stale_until)
     let now = now_ms();
-    let entry = Entry::new(user.clone(), now + 100, now + 2000);
-    store.set("users", &test_key, entry).await.unwrap();
+    let stored_entry = StoredEntry::from_serialized(
+        serde_json::to_string(&Entry::new(user.clone(), now + 100, now + 2000)).unwrap(),
+        now + 100,
+        now + 2000,
+    );
+    store.set("users", &test_key, stored_entry).await.unwrap();
 
     // Immediately after setting, should be retrievable
     let result = store.get("users", &test_key).await.unwrap();
@@ -722,12 +741,12 @@ async fn test_redis_no_expire_returns_expired_data_when_origin_fails() {
         url: "redis://localhost:6379".to_string(),
         disable_expiration: true,
     };
-    let store: Arc<dyn Store<User>> = Arc::new(
+    let store: Arc<dyn Store> = Arc::new(
         RedisStore::new(config)
             .await
             .expect("Failed to connect to Redis"),
     );
-    let cache = Namespace::new("users", vec![store], 100, 500); // 100ms fresh, 500ms stale
+    let cache = Cache::new("users", vec![store], 100, 500); // 100ms fresh, 500ms stale
 
     let test_key = format!("user:fallback_test_{}", now_ms());
     let user = User {

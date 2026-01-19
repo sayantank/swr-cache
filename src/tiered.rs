@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 
-use crate::entry::Entry;
+use crate::entry::{StorageMode, StoredEntry};
 use crate::error::CacheError;
 use crate::store::Store;
 
@@ -10,17 +10,13 @@ use crate::store::Store;
 ///
 /// Stores are checked in the order they are provided.
 /// The first store to return a value will be used to populate all previous stores.
-pub struct TieredStore<V>
-where
-    V: Clone + Send + Sync,
-{
-    tiers: Vec<Arc<dyn Store<V>>>,
+///
+/// TieredStore is type-agnostic and works with any combination of store types.
+pub struct TieredStore {
+    tiers: Vec<Arc<dyn Store>>,
 }
 
-impl<V> TieredStore<V>
-where
-    V: Clone + Send + Sync + 'static,
-{
+impl TieredStore {
     /// Create a new tiered store.
     ///
     /// Stores are checked in the order they are provided.
@@ -35,27 +31,32 @@ where
     ///     if enable_redis { Some(Arc::new(redis_store)) } else { None },
     /// ])
     /// ```
-    pub fn new(stores: Vec<Option<Arc<dyn Store<V>>>>) -> Self {
+    pub fn new(stores: Vec<Option<Arc<dyn Store>>>) -> Self {
         let tiers = stores.into_iter().flatten().collect();
         TieredStore { tiers }
     }
 
     /// Create a tiered store from a vec of stores (no optional filtering).
-    pub fn from_stores(stores: Vec<Arc<dyn Store<V>>>) -> Self {
+    pub fn from_stores(stores: Vec<Arc<dyn Store>>) -> Self {
         TieredStore { tiers: stores }
     }
 }
 
 #[async_trait]
-impl<V> Store<V> for TieredStore<V>
-where
-    V: Clone + Send + Sync + 'static,
-{
+impl Store for TieredStore {
     fn name(&self) -> &'static str {
         "tiered"
     }
 
-    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Entry<V>>, CacheError> {
+    fn storage_mode(&self) -> StorageMode {
+        // TieredStore adapts to its stores, but prefers Typed for efficiency
+        self.tiers
+            .first()
+            .map(|tier| tier.storage_mode())
+            .unwrap_or(StorageMode::Serialized)
+    }
+
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<StoredEntry>, CacheError> {
         if self.tiers.is_empty() {
             return Ok(None);
         }
@@ -63,7 +64,7 @@ where
         for (i, tier) in self.tiers.iter().enumerate() {
             let res = tier.get(namespace, key).await?;
 
-            if let Some(ref entry) = res {
+            if let Some(entry) = res {
                 // Fill all lower (earlier) tiers with this value in the background
                 if i > 0 {
                     let lower_tiers: Vec<_> = self.tiers[..i].to_vec();
@@ -80,14 +81,14 @@ where
                     });
                 }
 
-                return Ok(res);
+                return Ok(Some(entry));
             }
         }
 
         Ok(None)
     }
 
-    async fn set(&self, namespace: &str, key: &str, entry: Entry<V>) -> Result<(), CacheError> {
+    async fn set(&self, namespace: &str, key: &str, entry: StoredEntry) -> Result<(), CacheError> {
         // Set on all tiers in parallel
         let futures: Vec<_> = self
             .tiers
@@ -155,13 +156,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_tiered_get_populates_lower_tiers() {
-        let l1: Arc<dyn Store<String>> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
-        let l2: Arc<dyn Store<String>> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+        let l1: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
+        let l2: Arc<dyn Store> = Arc::new(HashMapStore::new(HashMapStoreConfig::default()));
 
         // Set value only in L2
         let now = now_ms();
-        let entry = Entry::new("value1".to_string(), now + 60_000, now + 300_000);
-        l2.set("users", "key1", entry.clone()).await.unwrap();
+        let entry = StoredEntry::from_typed("value1".to_string(), now + 60_000, now + 300_000);
+        l2.set("users", "key1", entry).await.unwrap();
 
         // L1 should be empty
         let result = l1.get("users", "key1").await.unwrap();
@@ -173,7 +174,9 @@ mod tests {
         // Get from tiered - should find in L2
         let result = tiered.get("users", "key1").await.unwrap();
         assert!(result.is_some());
-        assert_eq!(result.unwrap().value, "value1");
+        let stored = result.unwrap();
+        let typed_entry: crate::entry::Entry<String> = stored.into_typed().unwrap();
+        assert_eq!(typed_entry.value, "value1");
 
         // Give background task time to populate L1
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -181,6 +184,8 @@ mod tests {
         // L1 should now have the value
         let result = l1.get("users", "key1").await.unwrap();
         assert!(result.is_some());
-        assert_eq!(result.unwrap().value, "value1");
+        let stored = result.unwrap();
+        let typed_entry: crate::entry::Entry<String> = stored.into_typed().unwrap();
+        assert_eq!(typed_entry.value, "value1");
     }
 }
