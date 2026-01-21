@@ -564,43 +564,6 @@ let config = cache.swr("app_config", |_| async {
 - Stale data continues to revalidate in background
 - Perfect for: pricing data, feature flags, configuration, product catalogs
 
-## Performance Characteristics
-
-### HashMapStore
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Get (no contention) | ~100ns | Direct HashMap lookup |
-| Get (with writers) | ~10-100µs | Readers wait for write lock |
-| Set | ~1-10µs | Exclusive lock blocks all ops |
-| Eviction | ~1-50ms | Scans entire map under lock |
-| Scalability | Peaks at 8 threads | RwLock contention |
-
-### MokaStore
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Get (any load) | ~50-100ns | Lock-free |
-| Set (any load) | ~100-200ns | Lock-free CAS |
-| Eviction | Background | Never blocks operations |
-| Scalability | Linear to 32+ threads | Lock-free design |
-
-### RedisStore
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Get | ~1-5ms | Network roundtrip |
-| Set | ~1-5ms | Network + TTL |
-| Remove | ~1-5ms | Network roundtrip |
-
-### SWR Operations
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| SWR hit (fresh) | Store get time | No network/IO |
-| SWR hit (stale) | Store get time | Return immediately, revalidate async |
-| SWR miss | 0ms + origin time | Non-blocking, background cache |
-
 ## Configuration Recommendations
 
 ### High-Traffic API (millions of req/s)
