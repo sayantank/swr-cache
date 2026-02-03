@@ -65,6 +65,7 @@ pub use entry::{Entry, StorageMode, StoredEntry};
 pub use error::CacheError;
 pub use store::Store;
 pub use stores::memory::{EvictOnSetConfig, HashMapStore, HashMapStoreConfig};
+pub use stores::metrics::{CacheEntryStatus, CacheMetric, MetricsSink, MetricsStore};
 pub use stores::moka::{MokaStore, MokaStoreConfig};
 pub use stores::redis::{RedisStore, RedisStoreConfig};
 pub use swr::{SetOptions, SwrCache};
